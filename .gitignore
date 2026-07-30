@@ -1,0 +1,10 @@
+# Create .gitignore
+cat > .gitignore << 'EOF'
+.env
+*.pyc
+__pycache__
+paper_trading.db
+*.log
+.DS_Store
+mise.toml
+EOF
