@@ -1,3 +1,6 @@
+import os
+os.environ['PYTHONSAFEPATH'] = '1'
+
 from flask import Flask, jsonify, render_template_string, request, send_file
 import yfinance as yf
 import pandas as pd
