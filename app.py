@@ -1,5 +1,11 @@
 import os
+import sys
+
+# CRITICAL: Set PYTHONSAFEPATH before any imports
 os.environ['PYTHONSAFEPATH'] = '1'
+
+# Remove current directory from sys.path to prevent import issues
+sys.path = [p for p in sys.path if p != '' and p != '.']
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 import yfinance as yf
