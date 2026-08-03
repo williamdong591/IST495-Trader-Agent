@@ -1,1 +1,1 @@
-web: PYTHONSAFEPATH=1 gunicorn app:app
+web: PYTHONSAFEPATH=1 gunicorn --worker-tmp-dir /dev/shm app:app
