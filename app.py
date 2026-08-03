@@ -16,13 +16,15 @@ site_packages = '/app/.venv/lib/python3.11/site-packages'
 if site_packages not in sys.path:
     sys.path.insert(0, site_packages)
 
-# Rest of your imports continue here...
+# ============================================================
+# ALL IMPORTS - TextBlob REMOVED, using VADER instead
+# ============================================================
+
 from flask import Flask, jsonify, render_template_string, request, send_file
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import time
-import os
 import json
 import requests
 import io
@@ -37,7 +39,6 @@ import numpy as np
 from collections import deque
 import random
 import logging
-from textblob import TextBlob
 import sqlite3
 from pathlib import Path
 from sklearn.linear_model import LinearRegression
