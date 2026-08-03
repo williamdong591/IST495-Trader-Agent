@@ -1,0 +1,182 @@
+AI Stock Analyzer Pro - README
+⚡ Quick Start Guide
+Requirements
+Python 3.11.9 (exact version required)
+
+Internet connection for API calls
+
+2GB RAM minimum
+
+One-Click Setup
+bash
+# 1. Clone or download the repository
+git clone <your-repo-url>
+cd ai-stock-analyzer
+
+# 2. Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Create .env file (see below)
+# 5. Run the app
+python app.py
+Open http://localhost:5000 in your browser.
+
+📁 Project Structure
+text
+ai-stock-analyzer/
+├── app.py              # Main application (all code)
+├── .env                # API keys (create this)
+├── .env.example        # Template for API keys
+├── requirements.txt    # Python dependencies
+├── runtime.txt         # Python version
+├── Procfile           # Railway deployment
+├── start.sh           # Startup script
+└── README.md          # This file
+🔑 Required API Keys
+Create a .env file with:
+
+env
+# REQUIRED - Get from https://makersuite.google.com/app/apikey
+GEMINI_API_KEY=your_gemini_key
+
+# REQUIRED - Get from https://www.alphavantage.co/support/#api-key
+ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key
+
+# OPTIONAL - For additional AI providers
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+GROQ_API_KEY=your_groq_key
+
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=your_secret_key
+Minimum Viable Setup: Only Gemini and Alpha Vantage keys are required. The app will run with just these two.
+
+🚀 Running the Application
+Local Development
+bash
+python app.py
+# App runs on http://localhost:5000
+Production (Gunicorn)
+bash
+gunicorn --worker-tmp-dir /dev/shm app:app
+Railway Deployment
+bash
+railway up
+🛠️ What the App Does
+Feature	Description
+Stock Analysis	Analyzes 200+ stocks with AI recommendations
+AI Integration	Supports Gemini, OpenAI, Claude, Groq
+News Scraping	Aggregates news from 5 sources
+Paper Trading	Virtual trading with $10,000 starting balance
+Predictions	ML-based price predictions
+Technical Indicators	RSI, MACD, ADX, Bollinger Bands
+📡 Key Endpoints
+Endpoint	Method	Purpose
+/	GET	Web interface
+/api/analyze	POST	Analyze stocks
+/api/paper/status	GET	Portfolio status
+/api/paper/buy	POST	Buy shares
+/api/paper/sell	POST	Sell shares
+/api/paper/reset	POST	Reset account
+/api/export	POST	Export CSV data
+/api/status	GET	App status
+🔧 Troubleshooting
+Issue	Solution
+Module not found	pip install -r requirements.txt
+Port in use	Change port in app.py or kill process
+API key errors	Check .env file exists and keys are valid
+Database errors	Ensure write permissions in current directory
+News not loading	Wait 2-3 minutes for cache refresh
+Common Commands
+bash
+# Check Python version
+python --version  # Must be 3.11.9
+
+# Install specific package
+pip install flask==2.3.3
+
+# Kill process on port 5000 (Linux/macOS)
+lsof -ti:5000 | xargs kill -9
+
+# Kill process on port 5000 (Windows)
+netstat -ano | findstr :5000
+taskkill /PID <PID> /F
+📊 Testing Your Installation
+bash
+# Start the app
+python app.py
+
+# In another terminal, test the API
+curl http://localhost:5000/api/status
+Expected response shows "status":"online" and AI availability status.
+
+🚨 Important Notes
+Python Version: Must be exactly 3.11.9 (specified in runtime.txt)
+
+.env File: Must be in the root directory
+
+Internet Required: For stock data and AI calls
+
+AI Fallbacks: App works with technical analysis if AI keys are missing
+
+📦 Dependencies
+txt
+flask==2.3.3
+yfinance==0.2.28
+pandas==2.0.3
+numpy==1.24.3
+scikit-learn==1.3.0
+openai==1.3.0
+anthropic==0.7.7
+groq==0.4.1
+feedparser==6.0.10
+beautifulsoup4==4.12.2
+gunicorn==21.2.0
+Full list in requirements.txt.
+
+✅ Deployment Checklist
+□ Python 3.11.9 installed
+□ Virtual environment created
+□ pip install -r requirements.txt successful
+□ .env file created with API keys
+□ python app.py runs without errors
+□ Browser loads http://localhost:5000
+□ Stocks appear on the page
+□ Paper trading panel works
+🔗 Quick Links
+Service	URL	Purpose
+Gemini API	https://makersuite.google.com/app/apikey	AI analysis
+Alpha Vantage	https://www.alphavantage.co/support/#api-key	Stock data
+OpenAI	https://platform.openai.com/api-keys	Optional AI
+Anthropic	https://console.anthropic.com/	Optional AI
+Groq	https://console.groq.com/	Optional AI
+💡 Tips
+First Run: May take 10-15 seconds to load all stocks
+
+Auto-Refresh: Set to 1-5 minutes in the UI
+
+Paper Trading: Start with small trades to test
+
+AI Usage: Gemini is recommended (free tier)
+
+News Scraping: FeedFlash is the primary source (fixed)
+
+📄 License
+Proprietary - All Rights Reserved
+
+📞 Support
+For issues:
+
+Check Python version: python --version
+
+Verify .env file exists
+
+Ensure all packages installed
+
+Review error messages in terminal
+
+Version: 2.0.0 | Status: Production Ready ✅ | Updated: August 2026
