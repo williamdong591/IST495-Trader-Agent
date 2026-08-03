@@ -1,12 +1,22 @@
+#!/usr/bin/env python
 import os
 import sys
 
-# CRITICAL: Set PYTHONSAFEPATH before any imports
+# CRITICAL FIX FOR RAILWAY - Set this before ANYTHING else
 os.environ['PYTHONSAFEPATH'] = '1'
 
-# Remove current directory from sys.path to prevent import issues
-sys.path = [p for p in sys.path if p != '' and p != '.']
+# Remove current directory from path to prevent import issues
+if '' in sys.path:
+    sys.path.remove('')
+if '.' in sys.path:
+    sys.path.remove('.')
 
+# Force the correct site-packages path
+site_packages = '/app/.venv/lib/python3.11/site-packages'
+if site_packages not in sys.path:
+    sys.path.insert(0, site_packages)
+
+# Rest of your imports continue here...
 from flask import Flask, jsonify, render_template_string, request, send_file
 import yfinance as yf
 import pandas as pd
