@@ -1,8 +1,40 @@
-.env
+# Python
 __pycache__/
-*.pyc
-*.db
-*.sqlite3
-.DS_Store
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
 venv/
+ENV/
 env/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Railway
+*.railway
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mise
+.mise/
