@@ -19,12 +19,10 @@ import numpy as np
 from collections import deque
 import random
 import logging
+from textblob import TextBlob
 import sqlite3
 from pathlib import Path
-
-# ============================================================
-# NO TEXTBLOB - Using custom sentiment analysis instead
-# ============================================================
+import sys
 
 # OpenAI imports
 try:
@@ -40,88 +38,27 @@ logging.getLogger('anthropic').setLevel(logging.ERROR)
 logging.getLogger('groq').setLevel(logging.ERROR)
 logging.getLogger('openai').setLevel(logging.ERROR)
 
-# Load .env file with error handling
-try:
-    load_dotenv()
-    print("✓ Environment variables loaded")
-except Exception as e:
-    print(f"⚠️ Error loading .env file: {e}")
-    pass
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 
 # ============================================================
-# SENTIMENT ANALYSIS - Custom implementation (no TextBlob)
-# ============================================================
-
-def get_sentiment_analysis(text):
-    """Custom sentiment analysis without TextBlob/NLTK"""
-    if not text:
-        return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
-    
-    # Extensive keyword lists
-    very_positive = ['bullish', 'surge', 'soar', 'rocket', 'breakout', 'record high', 
-                     'outperform', 'strong buy', 'upgrade', 'beating', 'exceed']
-    positive = ['up', 'gain', 'positive', 'good', 'great', 'excellent', 'growth', 
-                'profit', 'beat', 'rally', 'strong', 'opportunity', 'win', 'success',
-                'higher', 'rise', 'jump', 'climb', 'advance', 'improve', 'boost']
-    very_negative = ['bearish', 'crash', 'plunge', 'tumble', 'collapse', 'downgrade',
-                     'underperform', 'strong sell', 'miss', 'disaster', 'terrible']
-    negative = ['down', 'loss', 'negative', 'bad', 'poor', 'decline', 'drop', 
-                'fall', 'weak', 'risk', 'danger', 'failure', 'problem', 'low',
-                'slip', 'slide', 'struggle', 'worry', 'concern']
-    
-    text_lower = text.lower()
-    
-    # Count weighted keywords
-    vp_count = sum(1 for word in very_positive if word in text_lower)
-    p_count = sum(1 for word in positive if word in text_lower)
-    vn_count = sum(1 for word in very_negative if word in text_lower)
-    n_count = sum(1 for word in negative if word in text_lower)
-    
-    # Weighted score
-    score = (vp_count * 2 + p_count - n_count - vn_count * 2)
-    
-    # Normalize
-    total = vp_count + p_count + vn_count + n_count
-    if total == 0:
-        return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
-    
-    normalized_score = max(-1, min(1, score / (total * 2)))
-    confidence = min(100, (total / 10) * 100 + 10)
-    
-    if normalized_score > 0.2:
-        label = "BULLISH" if normalized_score > 0.5 else "POSITIVE"
-    elif normalized_score < -0.2:
-        label = "BEARISH" if normalized_score < -0.5 else "NEGATIVE"
-    else:
-        label = "NEUTRAL"
-    
-    return {
-        'label': label,
-        'score': round(normalized_score, 2),
-        'confidence': round(confidence, 2)
-    }
-
-# ============================================================
-# DATABASE FOR PAPER TRADING
+# DATABASE FOR PAPER TRADING - RAILWAY COMPATIBLE
 # ============================================================
 
 class PaperTradingDB:
     def __init__(self):
-        # Use Railway volume if available for persistent storage
-        if os.environ.get('RAILWAY_VOLUME_MOUNT_PATH'):
-            db_dir = Path(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH'))
-            db_dir.mkdir(exist_ok=True)
-            self.db_path = db_dir / 'paper_trading.db'
+        # Use /tmp for Railway (writable), fallback to current directory
+        if os.environ.get('RAILWAY_ENVIRONMENT'):
+            self.db_path = Path('/tmp/paper_trading.db')
         else:
             self.db_path = Path('paper_trading.db')
-        
         self.init_db()
         self.cache = {}  # Cache for portfolio values to avoid repeated API calls
     
     def init_db(self):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         # Users table
@@ -161,7 +98,7 @@ class PaperTradingDB:
             )
         ''')
         
-        # Performance history table
+        # Performance history table for tracking portfolio over time
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS performance_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,7 +115,7 @@ class PaperTradingDB:
         conn.close()
     
     def get_or_create_user(self, username='default'):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute('SELECT user_id, cash FROM users WHERE username = ?', (username,))
@@ -196,7 +133,7 @@ class PaperTradingDB:
         return user_id, cash
     
     def get_portfolio(self, user_id):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT ticker, shares, avg_price FROM portfolio WHERE user_id = ?', (user_id,))
         results = cursor.fetchall()
@@ -204,7 +141,7 @@ class PaperTradingDB:
         return [{'ticker': r[0], 'shares': r[1], 'avg_price': r[2]} for r in results]
     
     def get_transactions(self, user_id, limit=50):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
             SELECT ticker, type, shares, price, total, timestamp 
@@ -218,7 +155,7 @@ class PaperTradingDB:
         return [{'ticker': r[0], 'type': r[1], 'shares': r[2], 'price': r[3], 'total': r[4], 'timestamp': r[5]} for r in results]
     
     def buy_stock(self, user_id, ticker, shares, price):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         total_cost = shares * price
@@ -269,7 +206,7 @@ class PaperTradingDB:
         return True, f"Bought {shares} shares of {ticker} at ${price:.2f} (Total: ${total_cost:.2f})"
     
     def sell_stock(self, user_id, ticker, shares, price):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         # Check holdings
@@ -324,7 +261,7 @@ class PaperTradingDB:
         portfolio = self.get_portfolio(user_id)
         
         # Get cash
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT cash FROM users WHERE user_id = ?', (user_id,))
         cash = cursor.fetchone()[0]
@@ -400,7 +337,7 @@ class PaperTradingDB:
     
     def _save_performance_history(self, user_id, portfolio_data):
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
             # Check if we already have a record for this minute
@@ -422,7 +359,7 @@ class PaperTradingDB:
             pass
     
     def get_performance_history(self, user_id, days=7):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
             SELECT total_value, cash, holdings_value, timestamp 
@@ -441,7 +378,7 @@ class PaperTradingDB:
         } for r in results]
     
     def get_cash(self, user_id):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT cash FROM users WHERE user_id = ?', (user_id,))
         cash = cursor.fetchone()[0]
@@ -457,7 +394,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ============================================================
-# AI CLIENTS - FIXED
+# AI CLIENTS
 # ============================================================
 
 openai_client = None
@@ -467,36 +404,17 @@ GROQ_RATE_LIMITED = False
 GROQ_LIMIT_RESET_TIME = None
 AI_DISABLED_GLOBALLY = False
 
-# Initialize OpenAI - FIXED VERSION
+# Initialize OpenAI
 if OPENAI_API_KEY and OPENAI_AVAILABLE:
     try:
-        # Try the standard initialization
         openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
         print("✓ OpenAI ready (primary AI)")
-    except TypeError as e:
-        # If there's a TypeError about proxies, try with http_client
-        if "proxies" in str(e) or "unexpected keyword" in str(e):
-            try:
-                import httpx
-                http_client = httpx.Client(timeout=60.0)
-                openai_client = openai.OpenAI(
-                    api_key=OPENAI_API_KEY,
-                    http_client=http_client
-                )
-                print("✓ OpenAI ready (primary AI) - using HTTP client")
-            except Exception as e2:
-                print(f"⚠️ OpenAI fallback error: {str(e2)[:60]}")
-                openai_client = None
-        else:
-            print(f"⚠️ OpenAI error: {str(e)[:60]}")
-            openai_client = None
     except Exception as e:
         print(f"⚠️ OpenAI error: {str(e)[:60]}")
         openai_client = None
 else:
     if not OPENAI_API_KEY:
         print("⚠️ No OpenAI API key found. Add OPENAI_API_KEY to .env file")
-    openai_client = None
 
 # Initialize Claude
 try:
@@ -613,297 +531,227 @@ class EnhancedNewsScraper:
     
     def scrape_marketwatch(self, ticker):
         results = {'news': []}
-        cache_key = f"marketwatch_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
             html = self._safe_scrape(f"https://www.marketwatch.com/investing/stock/{ticker}")
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.element--article .article__headline')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text,
-                            'time': '',
-                            'source': 'MarketWatch',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('div', class_=re.compile('article__content|element--article'))[:3]:
+                    headline_elem = article.find('h3') or article.find('a')
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text and len(text) > 10:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'MarketWatch',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_tradingview(self, ticker):
         results = {'news': []}
-        cache_key = f"tradingview_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            # TradingView is harder to scrape, use a different approach
-            html = self._safe_scrape(f"https://www.tradingview.com/symbols/{ticker}/")
+            url = f"https://www.tradingview.com/symbols/{ticker}/"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                # Try to find news items
-                news_items = soup.select('.tv-news')
-                for item in news_items[:5]:
-                    text = item.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'TradingView',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for item in soup.find_all('div', class_=re.compile('news|article|item|tv-news-item'))[:3]:
+                    headline_elem = item.find('a') or item.find('h3') or item.find('div', class_=re.compile('title|headline'))
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text and len(text) > 10:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'TradingView',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_yahoo_finance(self, ticker):
         results = {'news': []}
-        cache_key = f"yahoo_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://finance.yahoo.com/quote/{ticker}")
-            if html:
-                soup = BeautifulSoup(html, 'html.parser')
-                news_items = soup.select('.js-content-viewer .Mb\\(5px\\)')
-                for item in news_items[:5]:
-                    text = item.text.strip()
-                    if text and len(text) > 5:
+            stock = yf.Ticker(ticker)
+            news = stock.news
+            if news:
+                for item in news[:5]:
+                    headline = item.get('title', '')
+                    if headline:
                         news_item = {
-                            'headline': text[:200],
-                            'time': '',
+                            'headline': headline[:200],
                             'source': 'Yahoo Finance',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            'link': item.get('link', ''),
+                            'sentiment': self.ai_engine.get_ai_sentiment(headline) if self.ai_engine else {'label': 'NEUTRAL'}
                         }
                         results['news'].append(news_item)
                         self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
         except:
             pass
         return results
     
     def scrape_seeking_alpha(self, ticker):
         results = {'news': []}
-        cache_key = f"seekingalpha_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://seekingalpha.com/symbol/{ticker}/news")
+            url = f"https://seekingalpha.com/symbol/{ticker}/news"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.media-heading a')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'Seeking Alpha',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('article', class_=re.compile('article|post'))[:3]:
+                    headline_elem = article.find('h3') or article.find('a')
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Seeking Alpha',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_google_news(self, ticker):
         results = {'news': []}
-        cache_key = f"google_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            # Use RSS feed for Google News
-            rss_url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
-            feed = feedparser.parse(rss_url)
+            url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
+            feed = feedparser.parse(url)
             for entry in feed.entries[:5]:
-                if entry.get('title'):
-                    text = entry.title
-                    if len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': entry.get('published', ''),
-                            'source': 'Google News',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                news_item = {
+                    'headline': entry.title[:200],
+                    'source': 'Google News',
+                    'link': entry.link,
+                    'published': entry.published if hasattr(entry, 'published') else '',
+                    'sentiment': self.ai_engine.get_ai_sentiment(entry.title) if self.ai_engine else {'label': 'NEUTRAL'}
+                }
+                results['news'].append(news_item)
+                self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_stocktwits(self, ticker):
         results = {'news': []}
-        cache_key = f"stocktwits_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            # StockTwits API-like approach
-            html = self._safe_scrape(f"https://stocktwits.com/symbol/{ticker}")
-            if html:
-                soup = BeautifulSoup(html, 'html.parser')
-                messages = soup.select('.message__body')
-                for msg in messages[:5]:
-                    text = msg.text.strip()
-                    if text and len(text) > 5:
+            url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
+            response = self.session.get(url, timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                for msg in data.get('messages', [])[:5]:
+                    body = msg.get('body', '')
+                    if body and len(body) > 3:
                         news_item = {
-                            'headline': text[:200],
-                            'time': '',
+                            'headline': body[:150],
                             'source': 'StockTwits',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            'sentiment': self.ai_engine.get_ai_sentiment(body) if self.ai_engine else {'label': 'NEUTRAL'},
+                            'user': msg.get('user', {}).get('username', ''),
+                            'created': msg.get('created_at', '')
                         }
                         results['news'].append(news_item)
                         self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
         except:
             pass
         return results
     
     def scrape_bloomberg(self, ticker):
         results = {'news': []}
-        cache_key = f"bloomberg_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://www.bloomberg.com/quote/{ticker}:US")
+            url = f"https://www.bloomberg.com/search?query={ticker}"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.story-list-story__headline')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'Bloomberg',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('article')[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Bloomberg',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_cnbc(self, ticker):
         results = {'news': []}
-        cache_key = f"cnbc_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://www.cnbc.com/quotes/{ticker}")
+            url = f"https://www.cnbc.com/search/?query={ticker}"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.Card-title')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'CNBC',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('div', class_=re.compile('card|result|search-result'))[:3]:
+                    headline = article.find('a') or article.find('h3')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'CNBC',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_reuters(self, ticker):
         results = {'news': []}
-        cache_key = f"reuters_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://www.reuters.com/markets/companies/{ticker}.O/")
+            url = f"https://www.reuters.com/search/news?blob={ticker}"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.media-story-card__heading__text')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'Reuters',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('div', class_=re.compile('search-result|article'))[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Reuters',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
     
     def scrape_benzinga(self, ticker):
         results = {'news': []}
-        cache_key = f"benzinga_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
         try:
-            html = self._safe_scrape(f"https://www.benzinga.com/quote/{ticker}")
+            url = f"https://www.benzinga.com/search/?q={ticker}"
+            html = self._safe_scrape(url)
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                headlines = soup.select('.story__title a')
-                for h in headlines[:5]:
-                    text = h.text.strip()
-                    if text and len(text) > 5:
-                        news_item = {
-                            'headline': text[:200],
-                            'time': '',
-                            'source': 'Benzinga',
-                            'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            self.scrape_cache[cache_key] = (datetime.now(), results)
+                for article in soup.find_all('div', class_=re.compile('post|article|news-item'))[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Benzinga',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
         except:
             pass
         return results
-
+    
     def fetch_all_news(self, ticker):
         """Fetch news from ALL 11 sources with parallel processing"""
         all_news = {}
@@ -942,7 +790,7 @@ class EnhancedNewsScraper:
         return list(self.news_history)[-limit:]
 
 # ============================================================
-# AI ANALYSIS ENGINE - Using custom sentiment (no TextBlob)
+# AI ANALYSIS ENGINE
 # ============================================================
 
 class AIAnalysisEngine:
@@ -953,8 +801,24 @@ class AIAnalysisEngine:
         self.last_ai_source = None
         
     def get_ai_sentiment(self, text):
-        """Get sentiment using custom analyzer (no TextBlob)"""
-        return get_sentiment_analysis(text)
+        if not text:
+            return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
+        try:
+            blob = TextBlob(text)
+            polarity = blob.sentiment.polarity
+            if polarity > 0.3:
+                label = "BULLISH" if polarity > 0.6 else "POSITIVE"
+            elif polarity < -0.3:
+                label = "BEARISH" if polarity < -0.6 else "NEGATIVE"
+            else:
+                label = "NEUTRAL"
+            return {
+                'label': label,
+                'score': round(polarity, 2),
+                'confidence': min(100, abs(polarity) * 50 + 20)
+            }
+        except:
+            return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
     
     def get_ai_analysis(self, ticker, company, yahoo_data, sentiment_score, news_data):
         cache_key = f"{ticker}_{datetime.now().strftime('%Y-%m-%d-%H')}"
@@ -1136,6 +1000,10 @@ Return ONLY valid JSON with this format:
         price_vs_sma50 = yahoo_data.get('price_vs_sma50', 'BELOW')
         consecutive_down = yahoo_data.get('consecutive_down_days', 0)
         volume_ratio = yahoo_data.get('volume_ratio', 1)
+        
+        # ============================================================
+        # ENHANCED SCORING - More BUY opportunities
+        # ============================================================
         
         # 1. PRICE DIRECTION - PRIMARY (weighted heavily)
         if change > 0:
@@ -1724,6 +1592,10 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis):
     trend = data.get('trend', 'NEUTRAL')
     volume_ratio = data.get('volume_ratio', 1)
     
+    # ============================================================
+    # ENHANCED SCORING - Prioritizes upward momentum
+    # ============================================================
+    
     # 1. PRICE DIRECTION - PRIMARY
     if change > 0:
         if change > 3:
@@ -2023,336 +1895,16 @@ def analyze_stock_complete(ticker, use_ai=True):
 # FLASK ROUTES
 # ============================================================
 
-# IMPORTANT: Load the HTML template from a separate file or use the string
-# The HTML template is huge - consider storing it in a separate file
-# For Railway deployment, we'll use the string version
-
-# For now, we'll use the HTML_TEMPLATE string (you need to include the full HTML)
-# Since the HTML is very long, I'll create a placeholder and load it from a file
-
-# Try to load HTML from file, fallback to string
-html_template = None
-try:
-    # Check if the HTML template exists as a separate file
-    template_path = Path('templates/index.html')
-    if template_path.exists():
-        with open(template_path, 'r') as f:
-            html_template = f.read()
-        print("✓ Loaded HTML template from file")
-    else:
-        # Use the embedded template (you need to include the full HTML here)
-        # For this fix, I'll provide a minimal version - you should copy your full HTML
-        html_template = """<!DOCTYPE html>
-<html>
-<head>
-    <title>AI Stock Analyzer Pro</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;padding:20px;color:#fff}
-        .app-container{display:flex;gap:20px;max-width:1900px;margin:0 auto}
-        .main-content{flex:1;min-width:0}
-        .header{background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:18px 22px;margin-bottom:18px}
-        .header-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
-        h1{font-size:1.6em;display:flex;align-items:center;gap:8px}
-        .gradient{background:linear-gradient(135deg,#667eea,#764ba2);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-        .subtitle{color:#888;font-size:12px}
-        .btn{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;padding:7px 18px;border-radius:8px;font-size:13px;cursor:pointer;transition:all 0.3s;font-weight:600}
-        .btn:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(102,126,234,0.4)}
-        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin:12px 0}
-        .stat-card{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px 12px;text-align:center}
-        .stat-number{font-size:20px;font-weight:bold}
-        .stat-label{color:#888;font-size:9px;margin-top:2px}
-        .green{color:#4CAF50}.orange{color:#FF9800}.red{color:#f44336}.blue{color:#64B5F6}.gold{color:#FFD700}
-        .loading{text-align:center;padding:30px 20px}
-        .spinner{border:4px solid rgba(255,255,255,0.1);border-top:4px solid #667eea;border-radius:50%;width:35px;height:35px;animation:spin 1s linear infinite;margin:0 auto 12px}
-        @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-        .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin-top:10px}
-        .stock-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;transition:all 0.3s;cursor:pointer;min-height:300px;display:flex;flex-direction:column}
-        .stock-card:hover{transform:translateY(-3px);border-color:rgba(102,126,234,0.4);box-shadow:0 12px 35px rgba(0,0,0,0.3)}
-        .tabs{display:flex;gap:4px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px;flex-wrap:wrap}
-        .tab-btn{padding:6px 16px;border-radius:6px 6px 0 0;background:transparent;border:none;color:#888;cursor:pointer;font-size:12px;transition:all 0.3s;font-weight:600}
-        .tab-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
-        .tab-btn.active{color:#fff;background:rgba(102,126,234,0.2);border-bottom:2px solid #667eea}
-        .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-        .search-box{padding:6px 12px;border:2px solid rgba(255,255,255,0.1);border-radius:6px;background:rgba(255,255,255,0.05);color:#fff;flex:1;min-width:150px;font-size:12px}
-        .search-box:focus{outline:none;border-color:#667eea}
-        .filter-btn{padding:4px 10px;border:2px solid rgba(255,255,255,0.1);border-radius:5px;background:transparent;color:#aaa;cursor:pointer;font-size:10px}
-        .filter-btn:hover{border-color:#667eea;color:#fff}
-        .filter-btn.active{background:#667eea;color:#fff;border-color:#667eea}
-        .load-more-container{text-align:center;padding:20px 0}
-        .load-more-btn{background:rgba(102,126,234,0.15);border:2px solid rgba(102,126,234,0.3);color:#667eea;padding:10px 30px;border-radius:10px;font-size:14px;cursor:pointer;transition:all 0.3s;font-weight:600}
-        .load-more-btn:hover{background:rgba(102,126,234,0.25)}
-        .checkbox-label{font-size:11px;color:#aaa;display:flex;align-items:center;gap:4px;cursor:pointer;background:rgba(255,255,255,0.05);padding:3px 10px;border-radius:5px}
-        @media(max-width:768px){.app-container{flex-direction:column}.card-grid{grid-template-columns:1fr}}
-    </style>
-</head>
-<body>
-<div class="app-container">
-    <div class="main-content">
-        <div class="header">
-            <div class="header-top">
-                <div>
-                    <h1>🚀 <span class="gradient">AI Stock Analyzer Pro</span></h1>
-                    <div class="subtitle">Stocks • News • Paper Trading</div>
-                </div>
-                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-                    <span id="statusDot" style="font-size:10px;color:#4CAF50">🟢 Live</span>
-                    <span id="lastUpdate" style="font-size:9px;color:#666">Never</span>
-                    <button class="btn" onclick="refreshData()">🔄 Refresh</button>
-                </div>
-            </div>
-            <div class="stats">
-                <div class="stat-card"><div class="stat-number blue" id="totalStocks">0</div><div class="stat-label">Total</div></div>
-                <div class="stat-card"><div class="stat-number green" id="buyCount">0</div><div class="stat-label">Buy</div></div>
-                <div class="stat-card"><div class="stat-number orange" id="watchCount">0</div><div class="stat-label">Watch</div></div>
-                <div class="stat-card"><div class="stat-number red" id="sellCount">0</div><div class="stat-label">Sell</div></div>
-            </div>
-        </div>
-        
-        <div class="tabs">
-            <button class="tab-btn active" data-tab="all" onclick="switchTab('all')">📊 All Stocks</button>
-            <button class="tab-btn" data-tab="pinned" onclick="switchTab('pinned')">📌 Pinned</button>
-            <button class="tab-btn" data-tab="gainers" onclick="switchTab('gainers')">📈 Gainers</button>
-            <button class="tab-btn" data-tab="losers" onclick="switchTab('losers')">📉 Losers</button>
-        </div>
-        
-        <div class="controls">
-            <input class="search-box" id="searchInput" placeholder="🔍 Search ticker..." oninput="filterCards()">
-            <label class="checkbox-label">
-                <input type="checkbox" id="aiToggle" checked onchange="toggleAI()"> 🧠 AI
-            </label>
-        </div>
-        
-        <div id="loadingState" class="loading">
-            <div class="spinner"></div>
-            <div style="color:#888;font-size:14px">📊 Loading stocks with AI analysis...</div>
-        </div>
-        
-        <div id="resultsContent" style="display:none">
-            <div id="cardGrid" class="card-grid"></div>
-            <div class="load-more-container">
-                <button class="load-more-btn" onclick="loadMoreStocks()">➕ Add More Stocks</button>
-            </div>
-        </div>
-    </div>
-</div>
-
-<script>
-let allData = [];
-let pinnedStocks = JSON.parse(localStorage.getItem('pinnedStocks') || '[]');
-let currentSector = 'all';
-let currentTab = 'all';
-let useAI = true;
-let currentOffset = 0;
-let hasMore = true;
-let isLoadingMore = false;
-
-function switchTab(tab) {
-    currentTab = tab;
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-    renderCards();
-}
-
-function filterCards() { renderCards(); }
-
-function toggleAI() {
-    useAI = document.getElementById('aiToggle').checked;
-    currentOffset = 0;
-    allData = [];
-    refreshData();
-}
-
-function togglePin(ticker, event) {
-    event.stopPropagation();
-    const index = pinnedStocks.indexOf(ticker);
-    if (index > -1) pinnedStocks.splice(index, 1);
-    else pinnedStocks.push(ticker);
-    localStorage.setItem('pinnedStocks', JSON.stringify(pinnedStocks));
-    renderCards();
-    updateStats();
-}
-
-function isPinned(ticker) { return pinnedStocks.includes(ticker); }
-
-async function refreshData() {
-    const btn = document.querySelector('.btn');
-    btn.disabled = true;
-    btn.textContent = '⏳...';
-    
-    document.getElementById('loadingState').style.display = 'block';
-    document.getElementById('resultsContent').style.display = 'none';
-    
-    try {
-        const payload = {
-            sector: currentSector !== 'all' ? currentSector : null,
-            limit: 30,
-            offset: 0,
-            load_more: false,
-            use_ai: useAI,
-            pinned: pinnedStocks,
-            filters: {}
-        };
-        
-        const response = await fetch('/api/analyze', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const res = await response.json();
-        
-        if (res.success) {
-            allData = res.results;
-            hasMore = res.has_more || false;
-            currentOffset = 30;
-            
-            document.getElementById('lastUpdate').textContent = 'Updated: ' + res.last_update;
-            renderCards();
-            updateStats();
-        }
-    } catch(err) {
-        console.error(err);
-    } finally {
-        document.getElementById('loadingState').style.display = 'none';
-        document.getElementById('resultsContent').style.display = 'block';
-        btn.disabled = false;
-        btn.textContent = '🔄 Refresh';
-    }
-}
-
-function renderCards() {
-    const grid = document.getElementById('cardGrid');
-    let filtered = allData.filter(item => {
-        const search = document.getElementById('searchInput').value.toLowerCase();
-        if (search && !item.ticker.toLowerCase().includes(search)) return false;
-        return true;
-    });
-    
-    if (currentTab === 'pinned') {
-        filtered = filtered.filter(item => isPinned(item.ticker));
-    } else if (currentTab === 'gainers') {
-        filtered = filtered.filter(item => item.change_1d > 2).sort((a, b) => b.change_1d - a.change_1d);
-    } else if (currentTab === 'losers') {
-        filtered = filtered.filter(item => item.change_1d < -2).sort((a, b) => a.change_1d - b.change_1d);
-    }
-    
-    grid.innerHTML = '';
-    
-    filtered.forEach((item) => {
-        const card = document.createElement('div');
-        let cardClass = 'stock-card';
-        if (isPinned(item.ticker)) cardClass += ' pinned';
-        card.className = cardClass;
-        card.onclick = () => openModal(item);
-        
-        const recClass = (item.recommendation || 'WATCH').toLowerCase().replace(' ', '-');
-        const pinned = isPinned(item.ticker);
-        
-        card.innerHTML = `
-            <div style="display:flex;justify-content:space-between;align-items:flex-start">
-                <div>
-                    <div style="font-size:17px;font-weight:700">${item.ticker} ${pinned ? '📌' : ''}</div>
-                    <div style="font-size:11px;color:#888">${item.company}</div>
-                </div>
-                <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
-                    <button class="pin-btn" onclick="togglePin('${item.ticker}', event)">📌</button>
-                    <span class="card-rec ${recClass}">${item.recommendation || 'WATCH'}</span>
-                </div>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:6px 0">
-                <span style="font-size:20px;font-weight:700">$${item.price?.toFixed(2) || 'N/A'}</span>
-                <span style="font-size:14px;font-weight:600;color:${item.change_1d >= 0 ? '#4CAF50' : '#f44336'}">
-                    ${item.change_1d?.toFixed(1) || '0.0'}%
-                </span>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin:4px 0;font-size:11px;color:#aaa">
-                <div>RSI: ${item.rsi || 'N/A'}</div>
-                <div>Vol: ${item.volume_ratio?.toFixed(1) || 'N/A'}x</div>
-                <div>${item.trend || 'NEUTRAL'}</div>
-            </div>
-            <div style="font-size:11px;color:#bbb;flex:1;margin:4px 0">${item.summary || 'No analysis'}</div>
-            <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;color:#666;margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.05)">
-                <span>${item.ai_source || 'Technical'}</span>
-                <span>Score: ${Math.round(item.rank_score || 0)}</span>
-            </div>
-        `;
-        grid.appendChild(card);
-    });
-}
-
-function updateStats() {
-    document.getElementById('totalStocks').textContent = allData.length;
-    const buys = allData.filter(d => d.recommendation && d.recommendation.includes('BUY')).length;
-    const watches = allData.filter(d => d.recommendation === 'WATCH').length;
-    const sells = allData.filter(d => d.recommendation === 'SELL' || d.recommendation === 'AVOID').length;
-    document.getElementById('buyCount').textContent = buys;
-    document.getElementById('watchCount').textContent = watches;
-    document.getElementById('sellCount').textContent = sells;
-}
-
-function openModal(item) {
-    alert(`📊 ${item.ticker}\nPrice: $${item.price}\nChange: ${item.change_1d}%\nRSI: ${item.rsi}\nRecommendation: ${item.recommendation}\nConfidence: ${item.confidence}%\n${item.summary}`);
-}
-
-async function loadMoreStocks() {
-    if (isLoadingMore || !hasMore) return;
-    isLoadingMore = true;
-    const btn = document.querySelector('.load-more-btn');
-    btn.textContent = '⏳ Loading...';
-    btn.disabled = true;
-    
-    try {
-        const payload = {
-            sector: currentSector !== 'all' ? currentSector : null,
-            limit: 30,
-            offset: currentOffset,
-            load_more: true,
-            use_ai: useAI,
-            pinned: pinnedStocks,
-            filters: {}
-        };
-        
-        const response = await fetch('/api/analyze', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const res = await response.json();
-        
-        if (res.success && res.results.length > 0) {
-            const existingTickers = new Set(allData.map(d => d.ticker));
-            const newResults = res.results.filter(d => !existingTickers.has(d.ticker));
-            allData = [...allData, ...newResults];
-            hasMore = res.has_more || false;
-            currentOffset += 30;
-            renderCards();
-            updateStats();
-        }
-    } catch(err) {
-        console.error(err);
-    } finally {
-        isLoadingMore = false;
-        btn.textContent = '➕ Add More Stocks';
-        btn.disabled = false;
-    }
-}
-
-refreshData();
-</script>
-</body>
-</html>"""
-except Exception as e:
-    print(f"⚠️ Error loading HTML: {e}")
-    html_template = "<h1>Error loading template</h1>"
-
 @app.route('/')
 def index():
-    return render_template_string(html_template)
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()}), 200
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
@@ -2456,7 +2008,7 @@ def export_data():
     )
 
 # ============================================================
-# PAPER TRADING ROUTES
+# PAPER TRADING ROUTES - UPDATED WITH FIXES
 # ============================================================
 
 @app.route('/api/paper/status', methods=['GET'])
@@ -2465,6 +2017,7 @@ def paper_status():
     portfolio_value = paper_trading.get_portfolio_value(user_id)
     transactions = paper_trading.get_transactions(user_id)
     
+    # Get recent transactions for display
     recent_trades = []
     for t in transactions[:5]:
         recent_trades.append({
@@ -2494,6 +2047,7 @@ def paper_buy():
     if not ticker or shares <= 0:
         return jsonify({'success': False, 'error': 'Invalid input'}), 400
     
+    # Validate ticker exists
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1d")
@@ -2506,6 +2060,7 @@ def paper_buy():
     user_id, _ = paper_trading.get_or_create_user()
     success, message = paper_trading.buy_stock(user_id, ticker, shares, price)
     
+    # Get updated portfolio
     portfolio = paper_trading.get_portfolio_value(user_id)
     
     return jsonify({
@@ -2527,6 +2082,7 @@ def paper_sell():
     if not ticker or shares <= 0:
         return jsonify({'success': False, 'error': 'Invalid input'}), 400
     
+    # Validate ticker exists
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1d")
@@ -2539,6 +2095,7 @@ def paper_sell():
     user_id, _ = paper_trading.get_or_create_user()
     success, message = paper_trading.sell_stock(user_id, ticker, shares, price)
     
+    # Get updated portfolio
     portfolio = paper_trading.get_portfolio_value(user_id)
     
     return jsonify({
@@ -2555,7 +2112,7 @@ def paper_sell():
 def paper_reset():
     user_id, _ = paper_trading.get_or_create_user()
     
-    conn = sqlite3.connect(str(paper_trading.db_path))
+    conn = sqlite3.connect(paper_trading.db_path)
     cursor = conn.cursor()
     cursor.execute('DELETE FROM portfolio WHERE user_id = ?', (user_id,))
     cursor.execute('DELETE FROM transactions WHERE user_id = ?', (user_id,))
@@ -2564,6 +2121,7 @@ def paper_reset():
     conn.commit()
     conn.close()
     
+    # Clear cache
     if user_id in paper_trading.cache:
         del paper_trading.cache[user_id]
     
@@ -2590,6 +2148,10 @@ def news_feed():
     news = news_scraper.get_news_feed(200)
     return jsonify({'success': True, 'news': news, 'count': len(news)})
 
+@app.route('/api/stats/performance')
+def performance_stats():
+    return jsonify({'success': True, 'stats': []})
+
 @app.route('/api/status')
 def status():
     return jsonify({
@@ -2603,21 +2165,1325 @@ def status():
     })
 
 # ============================================================
-# RUN THE APP - Modified for Railway
+# HTML TEMPLATE - SAME AS BEFORE (too long to include twice)
+# ============================================================
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Stock Analyzer Pro - Paper Trading</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;padding:20px;color:#fff}
+        .app-container{display:flex;gap:20px;max-width:1900px;margin:0 auto}
+        .sidebar{width:400px;min-width:400px;background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:20px;max-height:calc(100vh - 40px);overflow-y:auto}
+        .sidebar.collapsed{width:0;min-width:0;padding:0;border:none;overflow:hidden}
+        .main-content{flex:1;min-width:0}
+        .header{background:rgba(255,255,255,0.05);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:18px 22px;margin-bottom:18px}
+        .header-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+        h1{font-size:1.6em;display:flex;align-items:center;gap:8px}
+        .gradient{background:linear-gradient(135deg,#667eea,#764ba2);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        .subtitle{color:#888;font-size:12px}
+        .btn{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none;padding:7px 18px;border-radius:8px;font-size:13px;cursor:pointer;transition:all 0.3s;font-weight:600}
+        .btn:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(102,126,234,0.4)}
+        .btn-success{background:linear-gradient(135deg,#4CAF50,#2E7D32);color:#fff;border:none;padding:7px 18px;border-radius:8px;font-size:13px;cursor:pointer;transition:all 0.3s;font-weight:600}
+        .btn-success:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(76,175,80,0.4)}
+        .btn-danger{background:linear-gradient(135deg,#f44336,#c62828);color:#fff;border:none;padding:7px 18px;border-radius:8px;font-size:13px;cursor:pointer;transition:all 0.3s;font-weight:600}
+        .btn-danger:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(244,67,54,0.4)}
+        .btn-sm{padding:4px 12px;font-size:11px}
+        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin:12px 0}
+        .stat-card{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:8px 12px;text-align:center}
+        .stat-number{font-size:20px;font-weight:bold}
+        .stat-label{color:#888;font-size:9px;margin-top:2px}
+        .green{color:#4CAF50}.orange{color:#FF9800}.red{color:#f44336}.blue{color:#64B5F6}.gold{color:#FFD700}
+        .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+        .search-box{padding:6px 12px;border:2px solid rgba(255,255,255,0.1);border-radius:6px;background:rgba(255,255,255,0.05);color:#fff;flex:1;min-width:150px;font-size:12px}
+        .search-box:focus{outline:none;border-color:#667eea}
+        .filter-btn{padding:4px 10px;border:2px solid rgba(255,255,255,0.1);border-radius:5px;background:transparent;color:#aaa;cursor:pointer;font-size:10px}
+        .filter-btn:hover{border-color:#667eea;color:#fff}
+        .filter-btn.active{background:#667eea;color:#fff;border-color:#667eea}
+        .checkbox-label{font-size:11px;color:#aaa;display:flex;align-items:center;gap:4px;cursor:pointer;background:rgba(255,255,255,0.05);padding:3px 10px;border-radius:5px}
+        .tabs{display:flex;gap:4px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px;flex-wrap:wrap}
+        .tab-btn{padding:6px 16px;border-radius:6px 6px 0 0;background:transparent;border:none;color:#888;cursor:pointer;font-size:12px;transition:all 0.3s;font-weight:600}
+        .tab-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
+        .tab-btn.active{color:#fff;background:rgba(102,126,234,0.2);border-bottom:2px solid #667eea}
+        .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin-top:10px}
+        .stock-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;transition:all 0.3s;cursor:pointer;min-height:300px;display:flex;flex-direction:column}
+        .stock-card:hover{transform:translateY(-3px);border-color:rgba(102,126,234,0.4);box-shadow:0 12px 35px rgba(0,0,0,0.3)}
+        .stock-card.pinned{border-color:#FFD700;background:rgba(255,215,0,0.05)}
+        .stock-card.bullish-highlight{border-color:#4CAF50;background:rgba(76,175,80,0.05)}
+        .stock-card.downtrend-warning{border-color:#f44336;background:rgba(244,67,54,0.05)}
+        .card-rec{padding:2px 10px;border-radius:14px;font-weight:700;font-size:10px;display:inline-block}
+        .card-rec.strong-buy{background:rgba(76,175,80,0.25);color:#4CAF50;border:1px solid rgba(76,175,80,0.25)}
+        .card-rec.buy{background:rgba(76,175,80,0.15);color:#81C784;border:1px solid rgba(76,175,80,0.15)}
+        .card-rec.watch{background:rgba(255,152,0,0.15);color:#FFB74D;border:1px solid rgba(255,152,0,0.15)}
+        .card-rec.avoid{background:rgba(244,67,54,0.15);color:#ef9a9a;border:1px solid rgba(244,67,54,0.15)}
+        .card-rec.sell{background:rgba(244,67,54,0.25);color:#f44336;border:1px solid rgba(244,67,54,0.25)}
+        .pin-btn{background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:0 4px;transition:all 0.3s}
+        .pin-btn:hover{color:#FFD700;transform:scale(1.2)}
+        .pin-btn.pinned{color:#FFD700}
+        .loading{text-align:center;padding:30px 20px}
+        .spinner{border:4px solid rgba(255,255,255,0.1);border-top:4px solid #667eea;border-radius:50%;width:35px;height:35px;animation:spin 1s linear infinite;margin:0 auto 12px}
+        @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+        .modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:1000;justify-content:center;align-items:center;padding:20px;backdrop-filter:blur(8px)}
+        .modal.active{display:flex}
+        .modal-content{background:#1a1a2e;border:1px solid rgba(255,255,255,0.1);border-radius:18px;max-width:950px;width:100%;max-height:90vh;overflow-y:auto;padding:22px}
+        .modal-close{font-size:26px;cursor:pointer;background:none;border:none;color:#666;padding:0 6px}
+        .modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:10px 0}
+        .modal-stat{background:rgba(255,255,255,0.05);border-radius:6px;padding:8px}
+        .modal-stat .label{color:#666;font-size:8px;text-transform:uppercase}
+        .modal-stat .value{font-size:13px;font-weight:bold;margin-top:2px}
+        .modal-chart{height:220px;margin:10px 0}
+        .ranking-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+        .ranking-item{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:8px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;transition:all 0.3s}
+        .ranking-item:hover{background:rgba(255,255,255,0.06)}
+        .ranking-item.pinned{border-color:#FFD700;background:rgba(255,215,0,0.05)}
+        .ranking-item.bullish-highlight{border-color:#4CAF50;background:rgba(76,175,80,0.05)}
+        .ranking-item.downtrend-warning{border-color:#f44336;background:rgba(244,67,54,0.05)}
+        .load-more-container{text-align:center;padding:20px 0}
+        .load-more-btn{background:rgba(102,126,234,0.15);border:2px solid rgba(102,126,234,0.3);color:#667eea;padding:10px 30px;border-radius:10px;font-size:14px;cursor:pointer;transition:all 0.3s;font-weight:600}
+        .load-more-btn:hover{background:rgba(102,126,234,0.25)}
+        .refresh-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05)}
+        .refresh-controls select{padding:4px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;font-size:11px}
+        .theme-toggle{background:none;border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:4px 8px;color:#aaa;cursor:pointer;font-size:14px}
+        .ai-badge{display:inline-block;padding:2px 8px;border-radius:8px;font-size:9px;font-weight:600}
+        .ai-badge.openai{background:rgba(255,152,0,0.2);color:#FFB74D}
+        .ai-badge.claude{background:rgba(156,39,176,0.2);color:#CE93D8}
+        .ai-badge.groq{background:rgba(76,175,80,0.2);color:#81C784}
+        .ai-badge.technical{background:rgba(255,255,255,0.05);color:#888}
+        .news-feed{max-height:400px;overflow-y:auto}
+        .news-item{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)}
+        .sort-btn{padding:2px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:transparent;color:#888;cursor:pointer;font-size:9px;transition:all 0.3s}
+        .sort-btn:hover{border-color:#667eea;color:#fff}
+        .sort-btn.active{background:#667eea;color:#fff;border-color:#667eea}
+        .filters-section{background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:12px}
+        .filters-section h4{font-size:12px;color:#888;margin-bottom:8px}
+        .filter-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+        .filter-row label{font-size:10px;color:#888;min-width:60px}
+        .filter-row input{width:70px;padding:3px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:3px;background:rgba(255,255,255,0.05);color:#fff;font-size:10px}
+        .filter-row select{padding:3px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:3px;background:rgba(255,255,255,0.05);color:#fff;font-size:10px}
+        .direction-up{color:#4CAF50}
+        .direction-down{color:#f44336}
+        .trend-bullish{color:#4CAF50}
+        .trend-bearish{color:#f44336}
+        .trend-neutral{color:#FFB74D}
+        .paper-trading-panel{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;margin-bottom:15px}
+        .paper-trading-panel h3{font-size:14px;margin-bottom:8px;color:#888}
+        .paper-stats{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+        .paper-stat{text-align:center;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px}
+        .paper-stat .value{font-size:18px;font-weight:bold}
+        .paper-stat .label{font-size:9px;color:#888}
+        .trade-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;padding:10px;background:rgba(255,255,255,0.03);border-radius:8px}
+        .trade-form input{width:80px;padding:4px 8px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;background:rgba(255,255,255,0.05);color:#fff;font-size:11px}
+        .trade-form select{padding:4px 8px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;background:rgba(255,255,255,0.05);color:#fff;font-size:11px}
+        .portfolio-item{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px}
+        .profit-positive{color:#4CAF50}
+        .profit-negative{color:#f44336}
+        .sell-btn{background:rgba(244,67,54,0.15);border:1px solid rgba(244,67,54,0.2);color:#f44336;padding:2px 10px;border-radius:4px;cursor:pointer;font-size:10px}
+        .sell-btn:hover{background:rgba(244,67,54,0.25)}
+        .transaction-item{font-size:10px;color:#888;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+        .transaction-buy{color:#4CAF50}
+        .transaction-sell{color:#f44336}
+        .portfolio-scroll{max-height:200px;overflow-y:auto}
+        .transactions-scroll{max-height:150px;overflow-y:auto}
+        @media(max-width:768px){.app-container{flex-direction:column}.sidebar{width:100%;min-width:unset;max-height:400px}.card-grid{grid-template-columns:1fr}.paper-stats{grid-template-columns:1fr 1fr}}
+    </style>
+</head>
+<body>
+<div class="app-container">
+    <div class="sidebar" id="sidebar">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
+            <h3 style="font-size:16px">⚙️ Filters & Settings</h3>
+            <button onclick="document.getElementById('sidebar').classList.toggle('collapsed')" style="background:none;border:none;color:#666;font-size:20px;cursor:pointer">✕</button>
+        </div>
+        
+        <!-- PAPER TRADING PANEL -->
+        <div class="paper-trading-panel">
+            <h3>💼 Paper Trading</h3>
+            <div class="paper-stats">
+                <div class="paper-stat">
+                    <div class="value gold" id="paperCash">$10,000</div>
+                    <div class="label">Cash</div>
+                </div>
+                <div class="paper-stat">
+                    <div class="value blue" id="paperValue">$0</div>
+                    <div class="label">Holdings</div>
+                </div>
+                <div class="paper-stat">
+                    <div class="value" id="paperTotal">$10,000</div>
+                    <div class="label">Total Value</div>
+                </div>
+                <div class="paper-stat">
+                    <div class="value" id="paperPL">+$0.00</div>
+                    <div class="label">Total P&L</div>
+                </div>
+            </div>
+            <div class="trade-form">
+                <select id="tradeAction" style="width:70px">
+                    <option value="buy">BUY</option>
+                    <option value="sell">SELL</option>
+                </select>
+                <input id="tradeTicker" placeholder="Ticker" style="width:70px">
+                <input id="tradeShares" placeholder="Shares" type="number" style="width:70px">
+                <button class="btn-success btn-sm" onclick="executeTrade()">Execute</button>
+                <button class="btn-danger btn-sm" onclick="resetPaperTrading()">Reset</button>
+            </div>
+            <div id="tradeMessage" style="font-size:11px;margin-top:4px;color:#888"></div>
+        </div>
+        
+        <!-- PORTFOLIO -->
+        <div class="paper-trading-panel">
+            <h3>📊 Portfolio</h3>
+            <div class="portfolio-scroll" id="portfolioList">
+                <div style="color:#666;font-size:11px;padding:8px 0">No holdings</div>
+            </div>
+        </div>
+        
+        <!-- TRANSACTIONS -->
+        <div class="paper-trading-panel">
+            <h3>📜 Recent Transactions</h3>
+            <div class="transactions-scroll" id="transactionList">
+                <div style="color:#666;font-size:11px;padding:8px 0">No transactions</div>
+            </div>
+        </div>
+        
+        <!-- AI STATUS -->
+        <div style="margin-bottom:15px;padding:10px;background:rgba(102,126,234,0.1);border-radius:8px">
+            <div style="font-size:11px;color:#888">🤖 AI Status</div>
+            <div style="font-size:11px;margin-top:4px">
+                <span id="aiOpenAI" style="color:#FFB74D">● OpenAI</span>
+                <span id="aiClaude" style="color:#CE93D8">● Claude</span>
+                <span id="aiGroq" style="color:#4CAF50">● Groq</span>
+            </div>
+        </div>
+        
+        <!-- FILTERS -->
+        <div class="filters-section">
+            <h4>💰 Price</h4>
+            <div class="filter-row">
+                <label>Min</label>
+                <input id="minPrice" placeholder="0" type="number">
+                <label>Max</label>
+                <input id="maxPrice" placeholder="10000" type="number">
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📊 RSI</h4>
+            <div class="filter-row">
+                <label>Min</label>
+                <input id="minRSI" placeholder="0" type="number">
+                <label>Max</label>
+                <input id="maxRSI" placeholder="100" type="number">
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📈 Volume Ratio</h4>
+            <div class="filter-row">
+                <label>Min</label>
+                <input id="minVolumeRatio" placeholder="0" type="number" step="0.1">
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📊 Daily Change %</h4>
+            <div class="filter-row">
+                <label>Min</label>
+                <input id="minChange" placeholder="-100" type="number" step="0.1">
+                <label>Max</label>
+                <input id="maxChange" placeholder="100" type="number" step="0.1">
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📈 Trend Filter</h4>
+            <div class="filter-row">
+                <select id="trendFilter" style="width:100%">
+                    <option value="all">All Trends</option>
+                    <option value="uptrend">Uptrend Only</option>
+                    <option value="downtrend">Downtrend Only</option>
+                </select>
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📰 News Sentiment</h4>
+            <div class="filter-row">
+                <select id="sentimentFilter" style="width:100%">
+                    <option value="all">All Sentiment</option>
+                    <option value="positive">Positive Only</option>
+                    <option value="negative">Negative Only</option>
+                </select>
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>🔍 Keyword Filter</h4>
+            <div class="filter-row">
+                <input id="keywordInput" placeholder="Enter keyword..." style="flex:1;padding:4px 8px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;background:rgba(255,255,255,0.05);color:#fff;font-size:11px">
+                <button onclick="addKeyword()" style="padding:4px 12px;border:none;border-radius:4px;background:#667eea;color:#fff;cursor:pointer;font-size:11px">Add</button>
+            </div>
+            <div id="keywordTags" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
+        </div>
+        
+        <div class="filters-section">
+            <h4>📰 News Sources</h4>
+            <div id="sourceGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:2px"></div>
+        </div>
+        
+        <div style="display:flex;gap:6px;margin-top:12px">
+            <button onclick="applyFilters()" style="flex:1;padding:6px;border:none;border-radius:6px;background:#667eea;color:#fff;cursor:pointer">Apply Filters</button>
+            <button onclick="resetFilters()" style="flex:1;padding:6px;border:1px solid rgba(255,255,255,0.1);border-radius:6px;background:transparent;color:#888;cursor:pointer">Reset</button>
+        </div>
+    </div>
+    
+    <div class="main-content">
+        <button onclick="document.getElementById('sidebar').classList.toggle('collapsed')" style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:8px 16px;color:#aaa;cursor:pointer;margin-bottom:15px">⚙️ Filters</button>
+        
+        <div class="header">
+            <div class="header-top">
+                <div>
+                    <h1>🚀 <span class="gradient">AI Stock Analyzer Pro</span></h1>
+                    <div class="subtitle">60+ Stocks • 11 News Sources • Paper Trading • Trend-Aware AI</div>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                    <span id="statusDot" style="font-size:10px;color:#4CAF50">🟢 Live</span>
+                    <span id="lastUpdate" style="font-size:9px;color:#666">Never</span>
+                    <button class="theme-toggle" onclick="toggleTheme()">🌙</button>
+                    <button onclick="exportData()" style="background:rgba(102,126,234,0.2);border:1px solid rgba(102,126,234,0.3);color:#667eea;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px">📥 Export</button>
+                    <button class="btn" onclick="refreshData()">🔄 Refresh</button>
+                </div>
+            </div>
+            
+            <div class="refresh-controls">
+                <label style="font-size:11px;color:#888">🔄 Auto-refresh:</label>
+                <select id="refreshInterval" onchange="setRefreshInterval()" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.05);color:#fff;font-size:11px">
+                    <option value="0">Never</option>
+                    <option value="60">1 min</option>
+                    <option value="300">5 min</option>
+                    <option value="600">10 min</option>
+                </select>
+                <span id="refreshTimer" style="font-size:10px;color:#666"></span>
+            </div>
+            
+            <div class="stats">
+                <div class="stat-card"><div class="stat-number blue" id="totalStocks">0</div><div class="stat-label">Total</div></div>
+                <div class="stat-card"><div class="stat-number green" id="buyCount">0</div><div class="stat-label">Buy</div></div>
+                <div class="stat-card"><div class="stat-number orange" id="watchCount">0</div><div class="stat-label">Watch</div></div>
+                <div class="stat-card"><div class="stat-number red" id="sellCount">0</div><div class="stat-label">Sell</div></div>
+                <div class="stat-card"><div class="stat-number gold" id="pinnedCount">0</div><div class="stat-label">📌 Pinned</div></div>
+            </div>
+            
+            <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#888">
+                <span>🤖 AI: <strong id="aiCount">0</strong></span>
+                <span>📰 News: <strong id="newsCount">0</strong></span>
+                <span>⚡ <span id="stockCount">0</span></span>
+                <span>📈 Momentum: <strong id="avgMomentum">0</strong></span>
+            </div>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="all" onclick="switchTab('all')">📊 All Stocks</button>
+            <button class="tab-btn" data-tab="ranking" onclick="switchTab('ranking')">🏆 Ranking</button>
+            <button class="tab-btn" data-tab="pinned" onclick="switchTab('pinned')">📌 Pinned</button>
+            <button class="tab-btn" data-tab="newsfeed" onclick="switchTab('newsfeed')">📰 News Feed</button>
+            <button class="tab-btn" data-tab="gainers" onclick="switchTab('gainers')">📈 Top Gainers</button>
+            <button class="tab-btn" data-tab="losers" onclick="switchTab('losers')">📉 Top Losers</button>
+            <button class="tab-btn" data-tab="uptrend" onclick="switchTab('uptrend')">📈 Uptrend</button>
+            <button class="tab-btn" data-tab="downtrend" onclick="switchTab('downtrend')">📉 Downtrend</button>
+        </div>
+        
+        <div class="controls">
+            <input class="search-box" id="searchInput" placeholder="🔍 Search ticker or company..." oninput="filterCards()">
+            
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+                <span style="font-size:9px;color:#666;font-weight:600">Sort:</span>
+                <button class="sort-btn active" data-sort="rank_score" onclick="setSort('rank_score')">Rank ▼</button>
+                <button class="sort-btn" data-sort="change_1d" onclick="setSort('change_1d')">Change ▼</button>
+                <button class="sort-btn" data-sort="momentum_score" onclick="setSort('momentum_score')">Momentum ▼</button>
+                <button class="sort-btn" data-sort="rsi" onclick="setSort('rsi')">RSI ▼</button>
+                <button class="sort-btn" data-sort="volume_ratio" onclick="setSort('volume_ratio')">Volume ▼</button>
+                <button class="sort-btn" data-sort="price" onclick="setSort('price')">Price ▼</button>
+                <button class="sort-btn" data-sort="ticker" onclick="setSort('ticker')">Ticker ▼</button>
+            </div>
+            
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+                <button class="filter-btn active" data-sector="all" onclick="setSector('all')">All</button>
+                <button class="filter-btn" data-sector="Technology" onclick="setSector('Technology')">Tech</button>
+                <button class="filter-btn" data-sector="Financial" onclick="setSector('Financial')">Fin</button>
+                <button class="filter-btn" data-sector="Healthcare" onclick="setSector('Healthcare')">Health</button>
+                <button class="filter-btn" data-sector="Consumer" onclick="setSector('Consumer')">Cons</button>
+                <button class="filter-btn" data-sector="Energy" onclick="setSector('Energy')">Energy</button>
+                <button class="filter-btn" data-sector="Industrial" onclick="setSector('Industrial')">Ind</button>
+                <button class="filter-btn" data-sector="Communications" onclick="setSector('Communications')">Comm</button>
+                <button class="filter-btn" data-sector="Real Estate" onclick="setSector('Real Estate')">RE</button>
+            </div>
+            
+            <label class="checkbox-label">
+                <input type="checkbox" id="aiToggle" checked onchange="toggleAI()"> 🧠 AI
+            </label>
+        </div>
+        
+        <div id="loadingState" class="loading">
+            <div class="spinner"></div>
+            <div style="color:#888;font-size:14px">📊 Loading stocks with AI analysis...</div>
+        </div>
+        
+        <div id="resultsContent" style="display:none">
+            <div id="cardGrid" class="card-grid"></div>
+            <div id="rankingContainer" style="display:none"></div>
+            <div id="newsFeedContainer" style="display:none"></div>
+            
+            <div class="load-more-container">
+                <button class="load-more-btn" onclick="loadMoreStocks()">➕ Add More Stocks</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="detailModal">
+    <div class="modal-content">
+        <div class="modal-header" style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+            <div>
+                <h2 id="modalTicker" style="font-size:20px"></h2>
+                <span id="modalCompany" style="color:#888;font-size:12px"></span>
+                <span id="modalDirection" style="font-size:11px;font-weight:bold"></span>
+                <span id="modalTrend" style="font-size:11px;margin-left:8px"></span>
+            </div>
+            <button class="modal-close" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-grid" id="modalStats"></div>
+        <div class="modal-chart"><canvas id="modalChart"></canvas></div>
+        <div id="modalNews" style="margin-top:10px;max-height:200px;overflow-y:auto"></div>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.05)">
+            <button class="btn-success btn-sm" onclick="quickTrade('buy')">📈 Buy</button>
+            <button class="btn-danger btn-sm" onclick="quickTrade('sell')">📉 Sell</button>
+            <span id="quickTradeInfo" style="font-size:11px;color:#888;margin-left:8px"></span>
+        </div>
+    </div>
+</div>
+
+<script>
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
+let allData = [];
+let currentSector = 'all';
+let currentTab = 'all';
+let useAI = true;
+let chart = null;
+let pinnedStocks = JSON.parse(localStorage.getItem('pinnedStocks') || '[]');
+let refreshTimer = null;
+let refreshIntervalSeconds = 0;
+let timeUntilRefresh = 0;
+let darkMode = true;
+let currentOffset = 0;
+let hasMore = true;
+let isLoadingMore = false;
+let keywords = [];
+let selectedSources = [];
+let newsFeed = [];
+let currentSort = 'rank_score';
+let sortDescending = true;
+let currentModalTicker = '';
+
+// ============================================================
+// PAPER TRADING FUNCTIONS - UPDATED
+// ============================================================
+
+async function updatePaperStatus() {
+    try {
+        const response = await fetch('/api/paper/status');
+        const data = await response.json();
+        if (data.success) {
+            const portfolio = data.portfolio;
+            
+            // Update main stats
+            document.getElementById('paperCash').textContent = '$' + portfolio.cash.toFixed(2);
+            document.getElementById('paperValue').textContent = '$' + portfolio.total_holdings_value.toFixed(2);
+            document.getElementById('paperTotal').textContent = '$' + portfolio.total_value.toFixed(2);
+            
+            // Update P&L
+            const pl = portfolio.total_profit_loss || 0;
+            const plElement = document.getElementById('paperPL');
+            plElement.textContent = (pl >= 0 ? '+' : '') + '$' + pl.toFixed(2);
+            plElement.style.color = pl >= 0 ? '#4CAF50' : '#f44336';
+            
+            // Update portfolio list
+            const list = document.getElementById('portfolioList');
+            if (portfolio.holdings && portfolio.holdings.length > 0) {
+                list.innerHTML = portfolio.holdings.map(h => `
+                    <div class="portfolio-item">
+                        <span><strong>${h.ticker}</strong> ${h.shares} shares @ $${h.avg_price.toFixed(2)}</span>
+                        <span>
+                            $${h.value.toFixed(2)} 
+                            <span class="${h.profit_loss >= 0 ? 'profit-positive' : 'profit-negative'}">
+                                ${h.profit_loss >= 0 ? '+' : ''}${h.profit_loss_pct.toFixed(1)}%
+                            </span>
+                            <button class="sell-btn" onclick="quickSell('${h.ticker}', ${h.shares})">Sell</button>
+                        </span>
+                    </div>
+                `).join('');
+            } else {
+                list.innerHTML = '<div style="color:#666;font-size:11px;padding:8px 0">No holdings</div>';
+            }
+            
+            // Update transactions
+            const transList = document.getElementById('transactionList');
+            if (data.transactions && data.transactions.length > 0) {
+                transList.innerHTML = data.transactions.slice(0, 10).map(t => `
+                    <div class="transaction-item">
+                        <span class="transaction-${t.type.toLowerCase()}">${t.type}</span>
+                        <strong>${t.ticker}</strong> 
+                        ${t.shares} @ $${t.price.toFixed(2)} 
+                        <span style="float:right">$${t.total.toFixed(2)}</span>
+                        <span style="float:right;margin-right:8px;font-size:8px;color:#666">${new Date(t.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                `).join('');
+            } else {
+                transList.innerHTML = '<div style="color:#666;font-size:11px;padding:8px 0">No transactions</div>';
+            }
+        }
+    } catch(e) {
+        console.error('Paper status error:', e);
+    }
+}
+
+async function executeTrade() {
+    const action = document.getElementById('tradeAction').value;
+    const ticker = document.getElementById('tradeTicker').value.toUpperCase().trim();
+    const shares = parseFloat(document.getElementById('tradeShares').value);
+    
+    if (!ticker || !shares || shares <= 0) {
+        document.getElementById('tradeMessage').textContent = '⚠️ Invalid input';
+        document.getElementById('tradeMessage').style.color = '#f44336';
+        return;
+    }
+    
+    const endpoint = action === 'buy' ? '/api/paper/buy' : '/api/paper/sell';
+    
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticker, shares })
+        });
+        const data = await response.json();
+        
+        document.getElementById('tradeMessage').textContent = data.message;
+        document.getElementById('tradeMessage').style.color = data.success ? '#4CAF50' : '#f44336';
+        
+        if (data.success) {
+            document.getElementById('tradeTicker').value = '';
+            document.getElementById('tradeShares').value = '';
+            updatePaperStatus();
+        }
+    } catch(e) {
+        document.getElementById('tradeMessage').textContent = '⚠️ Error executing trade';
+        document.getElementById('tradeMessage').style.color = '#f44336';
+    }
+}
+
+async function quickTrade(action) {
+    if (!currentModalTicker) return;
+    const shares = prompt(`Enter number of shares to ${action} for ${currentModalTicker}:`, '1');
+    if (!shares || parseFloat(shares) <= 0) return;
+    
+    const endpoint = action === 'buy' ? '/api/paper/buy' : '/api/paper/sell';
+    
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticker: currentModalTicker, shares: parseFloat(shares) })
+        });
+        const data = await response.json();
+        document.getElementById('quickTradeInfo').textContent = data.message;
+        document.getElementById('quickTradeInfo').style.color = data.success ? '#4CAF50' : '#f44336';
+        if (data.success) {
+            updatePaperStatus();
+        }
+    } catch(e) {
+        document.getElementById('quickTradeInfo').textContent = '⚠️ Error';
+        document.getElementById('quickTradeInfo').style.color = '#f44336';
+    }
+}
+
+async function quickSell(ticker, maxShares) {
+    const shares = prompt(`Enter number of shares to sell for ${ticker} (max ${maxShares}):`, maxShares);
+    if (!shares || parseFloat(shares) <= 0) return;
+    
+    try {
+        const response = await fetch('/api/paper/sell', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticker, shares: parseFloat(shares) })
+        });
+        const data = await response.json();
+        if (data.success) {
+            updatePaperStatus();
+        } else {
+            alert(data.message);
+        }
+    } catch(e) {
+        alert('Error selling');
+    }
+}
+
+async function resetPaperTrading() {
+    if (!confirm('Reset paper trading account to $10,000?')) return;
+    try {
+        const response = await fetch('/api/paper/reset', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            updatePaperStatus();
+            document.getElementById('tradeMessage').textContent = '✅ Account reset';
+            document.getElementById('tradeMessage').style.color = '#4CAF50';
+        }
+    } catch(e) {
+        alert('Error resetting');
+    }
+}
+
+// ============================================================
+// TAB FUNCTIONS
+// ============================================================
+
+function switchTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+    renderCards();
+}
+
+function togglePin(ticker, event) {
+    event.stopPropagation();
+    const index = pinnedStocks.indexOf(ticker);
+    if (index > -1) pinnedStocks.splice(index, 1);
+    else pinnedStocks.push(ticker);
+    localStorage.setItem('pinnedStocks', JSON.stringify(pinnedStocks));
+    renderCards();
+    updateStats();
+    updatePaperStatus();
+}
+
+function isPinned(ticker) { return pinnedStocks.includes(ticker); }
+
+function setSort(sort) {
+    const btn = document.querySelector(`.sort-btn[data-sort="${sort}"]`);
+    if (currentSort === sort) {
+        sortDescending = !sortDescending;
+    } else {
+        currentSort = sort;
+        sortDescending = true;
+    }
+    document.querySelectorAll('.sort-btn').forEach(b => {
+        b.classList.remove('active');
+        if (b.dataset.sort === sort) {
+            b.classList.add('active');
+            b.textContent = b.textContent.replace(/[▼▲]/g, '') + (sortDescending ? ' ▼' : ' ▲');
+        }
+    });
+    renderCards();
+}
+
+function addKeyword() {
+    const input = document.getElementById('keywordInput');
+    const keyword = input.value.trim();
+    if (keyword && !keywords.includes(keyword)) {
+        keywords.push(keyword);
+        renderKeywords();
+        input.value = '';
+    }
+}
+
+function removeKeyword(keyword) {
+    keywords = keywords.filter(k => k !== keyword);
+    renderKeywords();
+}
+
+function renderKeywords() {
+    const container = document.getElementById('keywordTags');
+    container.innerHTML = keywords.map(k => `
+        <span style="display:flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:10px;background:rgba(102,126,234,0.2);color:#aaa;border:1px solid rgba(102,126,234,0.2)">
+            ${k} <span onclick="removeKeyword('${k}')" style="color:#888;cursor:pointer">×</span>
+        </span>
+    `).join('');
+}
+
+function setRefreshInterval() {
+    const select = document.getElementById('refreshInterval');
+    refreshIntervalSeconds = parseInt(select.value);
+    if (refreshTimer) clearInterval(refreshTimer);
+    if (refreshIntervalSeconds === 0) {
+        document.getElementById('refreshTimer').textContent = '';
+        return;
+    }
+    timeUntilRefresh = refreshIntervalSeconds;
+    updateRefreshTimer();
+    refreshTimer = setInterval(() => {
+        timeUntilRefresh--;
+        updateRefreshTimer();
+        if (timeUntilRefresh <= 0) {
+            refreshData();
+            timeUntilRefresh = refreshIntervalSeconds;
+        }
+    }, 1000);
+}
+
+function updateRefreshTimer() {
+    if (refreshIntervalSeconds === 0) return;
+    const mins = Math.floor(timeUntilRefresh / 60);
+    const secs = timeUntilRefresh % 60;
+    document.getElementById('refreshTimer').textContent = `⏱️ ${mins}:${secs.toString().padStart(2,'0')}`;
+}
+
+function toggleTheme() {
+    darkMode = !darkMode;
+    document.body.style.background = darkMode ? 'linear-gradient(135deg,#0f0c29,#302b63,#24243e)' : 'linear-gradient(135deg,#f5f7fa,#c3cfe2)';
+    document.body.style.color = darkMode ? '#fff' : '#1a1a2e';
+    document.querySelector('.theme-toggle').textContent = darkMode ? '🌙' : '☀️';
+    localStorage.setItem('darkMode', darkMode);
+}
+
+function getFilters() {
+    return {
+        min_price: parseFloat(document.getElementById('minPrice').value) || 0,
+        max_price: parseFloat(document.getElementById('maxPrice').value) || 10000,
+        min_rsi: parseFloat(document.getElementById('minRSI').value) || 0,
+        max_rsi: parseFloat(document.getElementById('maxRSI').value) || 100,
+        min_volume_ratio: parseFloat(document.getElementById('minVolumeRatio').value) || 0,
+        min_change: parseFloat(document.getElementById('minChange').value) || -100,
+        max_change: parseFloat(document.getElementById('maxChange').value) || 100,
+        sentiment_filter: document.getElementById('sentimentFilter').value,
+        trend_filter: document.getElementById('trendFilter').value
+    };
+}
+
+// ============================================================
+// LOAD SETTINGS & NEWS SOURCES
+// ============================================================
+
+async function loadSettings() {
+    try {
+        const response = await fetch('/api/news/sources');
+        const data = await response.json();
+        if (data.success) {
+            const grid = document.getElementById('sourceGrid');
+            grid.innerHTML = '';
+            for (const [key, src] of Object.entries(data.sources)) {
+                const div = document.createElement('div');
+                div.style.cssText = 'display:flex;align-items:center;gap:4px;padding:2px 6px;border-radius:3px;font-size:10px;color:#aaa';
+                div.innerHTML = `
+                    <input type="checkbox" value="${key}" onchange="updateSources()" ${src.enabled !== false ? 'checked' : ''}>
+                    <span>${src.icon} ${src.name}</span>
+                `;
+                grid.appendChild(div);
+                if (src.enabled !== false && !selectedSources.includes(key)) {
+                    selectedSources.push(key);
+                }
+            }
+        }
+    } catch(e) { console.error(e); }
+}
+
+function updateSources() {
+    const checkboxes = document.querySelectorAll('#sourceGrid input[type="checkbox"]:checked');
+    selectedSources = Array.from(checkboxes).map(cb => cb.value);
+}
+
+function applyFilters() {
+    currentOffset = 0;
+    allData = [];
+    refreshData();
+}
+
+function resetFilters() {
+    document.getElementById('minPrice').value = '';
+    document.getElementById('maxPrice').value = '';
+    document.getElementById('minRSI').value = '';
+    document.getElementById('maxRSI').value = '';
+    document.getElementById('minVolumeRatio').value = '';
+    document.getElementById('minChange').value = '';
+    document.getElementById('maxChange').value = '';
+    document.getElementById('sentimentFilter').value = 'all';
+    document.getElementById('trendFilter').value = 'all';
+    keywords = [];
+    renderKeywords();
+    document.querySelectorAll('#sourceGrid input[type="checkbox"]').forEach(cb => cb.checked = true);
+    selectedSources = ['finviz', 'marketwatch', 'tradingview', 'yahoo', 'seekingalpha', 'google_news', 'stocktwits', 'bloomberg', 'cnbc', 'reuters', 'benzinga'];
+    document.getElementById('keywordInput').value = '';
+    currentOffset = 0;
+    allData = [];
+    refreshData();
+}
+
+// ============================================================
+// MAIN DATA REFRESH
+// ============================================================
+
+async function refreshData() {
+    const btn = document.querySelector('.btn');
+    btn.disabled = true;
+    btn.textContent = '⏳...';
+    
+    document.getElementById('loadingState').style.display = 'block';
+    document.getElementById('resultsContent').style.display = 'none';
+    
+    try {
+        const payload = {
+            sector: currentSector !== 'all' ? currentSector : null,
+            limit: 30,
+            offset: 0,
+            load_more: false,
+            use_ai: useAI,
+            keywords: keywords,
+            sources: selectedSources,
+            pinned: pinnedStocks,
+            filters: getFilters()
+        };
+        
+        const response = await fetch('/api/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const res = await response.json();
+        
+        if (res.success) {
+            allData = res.results;
+            hasMore = res.has_more || false;
+            currentOffset = 30;
+            
+            document.getElementById('lastUpdate').textContent = 'Updated: ' + res.last_update;
+            
+            let totalNews = 0;
+            let totalMomentum = 0;
+            allData.forEach(item => {
+                if (item.news) {
+                    for (const s in item.news) {
+                        if (item.news[s]) totalNews += item.news[s].length;
+                    }
+                }
+                totalMomentum += item.momentum_score || 0;
+            });
+            document.getElementById('newsCount').textContent = totalNews;
+            document.getElementById('stockCount').textContent = allData.length;
+            document.getElementById('avgMomentum').textContent = allData.length > 0 ? Math.round(totalMomentum / allData.length) : 0;
+            
+            const aiCount = res.stats ? (res.stats.openai || 0) + (res.stats.claude || 0) + (res.stats.groq || 0) : 0;
+            document.getElementById('aiCount').textContent = aiCount;
+            
+            if (res.ai_availability) {
+                document.getElementById('aiOpenAI').style.color = res.ai_availability.openai ? '#FFB74D' : '#666';
+                document.getElementById('aiClaude').style.color = res.ai_availability.claude ? '#CE93D8' : '#666';
+                document.getElementById('aiGroq').style.color = res.ai_availability.groq ? '#4CAF50' : '#666';
+            }
+            
+            renderCards();
+            updateStats();
+            updatePaperStatus();
+            loadNewsFeed();
+        }
+    } catch(err) {
+        console.error(err);
+    } finally {
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('resultsContent').style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = '🔄 Refresh';
+    }
+}
+
+async function loadNewsFeed() {
+    try {
+        const response = await fetch('/api/news/feed?limit=200');
+        const data = await response.json();
+        if (data.success) {
+            newsFeed = data.news;
+            if (currentTab === 'newsfeed') renderCards();
+        }
+    } catch(e) { console.error(e); }
+}
+
+async function loadMoreStocks() {
+    if (isLoadingMore || !hasMore) return;
+    isLoadingMore = true;
+    const btn = document.querySelector('.load-more-btn');
+    btn.textContent = '⏳ Loading...';
+    btn.disabled = true;
+    
+    currentOffset += 30;
+    
+    try {
+        const payload = {
+            sector: currentSector !== 'all' ? currentSector : null,
+            limit: 30,
+            offset: currentOffset,
+            load_more: true,
+            use_ai: useAI,
+            keywords: keywords,
+            sources: selectedSources,
+            pinned: pinnedStocks,
+            filters: getFilters()
+        };
+        
+        const response = await fetch('/api/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const res = await response.json();
+        
+        if (res.success && res.results.length > 0) {
+            const existingTickers = new Set(allData.map(d => d.ticker));
+            const newResults = res.results.filter(d => !existingTickers.has(d.ticker));
+            allData = [...allData, ...newResults];
+            hasMore = res.has_more || false;
+            renderCards();
+            updateStats();
+            updatePaperStatus();
+        }
+    } catch(err) {
+        console.error(err);
+    } finally {
+        isLoadingMore = false;
+        btn.textContent = '➕ Add More Stocks';
+        btn.disabled = false;
+    }
+}
+
+// ============================================================
+// RENDER FUNCTIONS
+// ============================================================
+
+function renderCards() {
+    const grid = document.getElementById('cardGrid');
+    const rankingContainer = document.getElementById('rankingContainer');
+    const newsFeedContainer = document.getElementById('newsFeedContainer');
+    
+    grid.style.display = 'none';
+    rankingContainer.style.display = 'none';
+    newsFeedContainer.style.display = 'none';
+    
+    if (currentTab === 'newsfeed') {
+        newsFeedContainer.style.display = 'block';
+        renderNewsFeed(newsFeedContainer);
+        return;
+    }
+    
+    let filtered = allData.filter(item => {
+        if (currentSector !== 'all' && item.sector !== currentSector) return false;
+        const search = document.getElementById('searchInput').value.toLowerCase();
+        if (search && !item.ticker.toLowerCase().includes(search) && !item.company.toLowerCase().includes(search)) return false;
+        return true;
+    });
+    
+    // Tab-specific filtering
+    if (currentTab === 'pinned') {
+        filtered = filtered.filter(item => isPinned(item.ticker));
+    } else if (currentTab === 'gainers') {
+        filtered = filtered.filter(item => item.change_1d > 2).sort((a, b) => b.change_1d - a.change_1d);
+    } else if (currentTab === 'losers') {
+        filtered = filtered.filter(item => item.change_1d < -2).sort((a, b) => a.change_1d - b.change_1d);
+    } else if (currentTab === 'uptrend') {
+        filtered = filtered.filter(item => item.trend && (item.trend.includes('BULLISH') || item.trend.includes('UPTREND')));
+    } else if (currentTab === 'downtrend') {
+        filtered = filtered.filter(item => item.trend && (item.trend.includes('BEARISH') || item.trend.includes('DOWNTREND')));
+    }
+    
+    // Apply sorting
+    if (currentSort && currentTab !== 'gainers' && currentTab !== 'losers') {
+        filtered.sort((a, b) => {
+            let va = a[currentSort] ?? 0;
+            let vb = b[currentSort] ?? 0;
+            if (typeof va === 'string') {
+                return sortDescending ? va.localeCompare(vb) : vb.localeCompare(va);
+            }
+            return sortDescending ? vb - va : va - vb;
+        });
+    }
+    
+    if (currentTab === 'ranking' || currentTab === 'pinned') {
+        rankingContainer.style.display = 'block';
+        renderRankingList(filtered, rankingContainer);
+        return;
+    }
+    
+    grid.style.display = 'grid';
+    renderCardGrid(filtered, grid);
+}
+
+function renderCardGrid(filtered, grid) {
+    grid.innerHTML = '';
+    
+    filtered.forEach((item) => {
+        const card = document.createElement('div');
+        const isBullish = (item.trend && item.trend.includes('BULLISH')) && item.change_1d > 0;
+        const isDowntrend = item.consecutive_down_days >= 3 || (item.trend && item.trend.includes('BEARISH'));
+        let cardClass = 'stock-card';
+        if (isPinned(item.ticker)) cardClass += ' pinned';
+        if (isBullish) cardClass += ' bullish-highlight';
+        if (isDowntrend) cardClass += ' downtrend-warning';
+        card.className = cardClass;
+        card.onclick = () => openModal(item);
+        
+        const recClass = (item.recommendation || 'WATCH').toLowerCase().replace(' ', '-');
+        const pinned = isPinned(item.ticker);
+        const aiSource = item.ai_source || item.source || 'Technical';
+        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : 'technical';
+        const momentum = item.momentum_score || 50;
+        const sentiment = item.sentiment_aggregate || 0;
+        const sentimentEmoji = sentiment > 0.3 ? '🟢' : sentiment < -0.3 ? '🔴' : '🟡';
+        const direction = item.price_direction || (item.change_1d > 0 ? 'UP' : 'DOWN');
+        const directionClass = direction === 'UP' ? 'direction-up' : 'direction-down';
+        const downDays = item.consecutive_down_days || 0;
+        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : 
+                          item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
+        
+        let newsCount = 0;
+        if (item.news) {
+            for (const s in item.news) {
+                if (item.news[s]) newsCount += item.news[s].length;
+            }
+        }
+        
+        card.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                <div>
+                    <div style="font-size:17px;font-weight:700">${item.ticker} ${pinned ? '📌' : ''}</div>
+                    <div style="font-size:11px;color:#888">${item.company}</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+                    <button class="pin-btn ${pinned ? 'pinned' : ''}" onclick="togglePin('${item.ticker}', event)">📌</button>
+                    <span class="card-rec ${recClass}">${item.recommendation || 'WATCH'}</span>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin:6px 0">
+                <span style="font-size:20px;font-weight:700">$${item.price?.toFixed(2) || 'N/A'}</span>
+                <span style="font-size:14px;font-weight:600;color:${item.change_1d >= 0 ? '#4CAF50' : '#f44336'}">
+                    ${item.change_1d?.toFixed(1) || '0.0'}% <span class="${directionClass}">${direction === 'UP' ? '▲' : '▼'}</span>
+                </span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;font-size:11px;color:#aaa">
+                <div>RSI: ${item.rsi || 'N/A'}</div>
+                <div>Vol: ${item.volume_ratio?.toFixed(1) || 'N/A'}x</div>
+                <div class="${trendClass}">${item.trend_icon || '➡️'} ${item.trend || 'NEUTRAL'}</div>
+                <div>${sentimentEmoji} Sentiment</div>
+            </div>
+            ${downDays >= 2 ? `<div style="font-size:10px;color:#f44336;font-weight:bold">⚠️ ${downDays} consecutive down days</div>` : ''}
+            ${isBullish ? `<div style="font-size:10px;color:#4CAF50;font-weight:bold">✅ Uptrend momentum</div>` : ''}
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin:2px 0">
+                <span>Momentum: ${momentum}%</span>
+                <span>📰 ${newsCount}</span>
+                <span>Conf: ${item.confidence || 0}%</span>
+            </div>
+            <div style="font-size:11px;color:#bbb;flex:1;margin:4px 0">${item.summary || 'No analysis'}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;color:#666;margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.05)">
+                <span class="ai-badge ${aiClass}">${aiSource}</span>
+                <span>Score: ${Math.round(item.rank_score || 0)}</span>
+            </div>
+        `;
+        grid.appendChild(card);
+    });
+}
+
+function renderRankingList(filtered, container) {
+    container.innerHTML = `
+        <div style="display:flex;align-items:center;gap:12px;padding:8px 14px;color:#666;font-size:10px;font-weight:600;border-bottom:1px solid rgba(255,255,255,0.05)">
+            <span style="min-width:30px">#</span>
+            <span style="min-width:60px">Ticker</span>
+            <span style="flex:1">Company</span>
+            <span style="min-width:60px;text-align:right">Price</span>
+            <span style="min-width:60px;text-align:right">Change</span>
+            <span style="min-width:50px;text-align:right">RSI</span>
+            <span style="min-width:50px;text-align:right">Momentum</span>
+            <span style="min-width:60px;text-align:center">Rec</span>
+            <span style="min-width:50px;text-align:center">Trend</span>
+            <span style="min-width:60px;text-align:center">AI</span>
+            <span style="min-width:50px;text-align:right">Score</span>
+            <span style="min-width:30px;text-align:center">📌</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
+    `;
+    
+    filtered.forEach((item, index) => {
+        const pinned = isPinned(item.ticker);
+        const isBullish = (item.trend && item.trend.includes('BULLISH')) && item.change_1d > 0;
+        const isDowntrend = item.consecutive_down_days >= 3 || (item.trend && item.trend.includes('BEARISH'));
+        let rowClass = 'ranking-item';
+        if (pinned) rowClass += ' pinned';
+        if (isBullish) rowClass += ' bullish-highlight';
+        if (isDowntrend) rowClass += ' downtrend-warning';
+        
+        const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index+1}`;
+        const aiSource = item.ai_source || item.source || 'Technical';
+        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : 'technical';
+        const momentum = item.momentum_score || 50;
+        const direction = item.price_direction || (item.change_1d > 0 ? 'UP' : 'DOWN');
+        const downDays = item.consecutive_down_days || 0;
+        const trendDisplay = item.trend ? item.trend.substring(0, 12) : 'NEUTRAL';
+        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : 
+                          item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
+        
+        container.innerHTML += `
+            <div class="${rowClass}" onclick="openModal(item)" data-ticker="${item.ticker}">
+                <span style="min-width:30px;font-weight:bold;color:#667eea">${rankEmoji}</span>
+                <span style="min-width:60px;font-weight:600">${item.ticker}</span>
+                <span style="flex:1;font-size:11px;color:#888">${item.company}</span>
+                <span style="min-width:60px;text-align:right;font-weight:600">$${item.price?.toFixed(2) || 'N/A'}</span>
+                <span style="min-width:60px;text-align:right;font-weight:600;color:${item.change_1d >= 0 ? '#4CAF50' : '#f44336'}">
+                    ${item.change_1d?.toFixed(1) || '0.0'}% ${direction === 'UP' ? '▲' : '▼'}
+                </span>
+                <span style="min-width:50px;text-align:right;font-weight:600">${item.rsi || 'N/A'}</span>
+                <span style="min-width:50px;text-align:right;font-weight:600;color:${momentum >= 60 ? '#4CAF50' : momentum >= 40 ? '#FFB74D' : '#f44336'}">${momentum}%</span>
+                <span style="min-width:60px;text-align:center;padding:2px 8px;border-radius:10px;font-weight:600;font-size:9px;background:rgba(102,126,234,0.1);color:#667eea">${item.recommendation || 'WATCH'}</span>
+                <span style="min-width:50px;text-align:center;font-size:9px" class="${trendClass}">${trendDisplay}${downDays >= 3 ? '⚠️' : ''}</span>
+                <span style="min-width:60px;text-align:center"><span class="ai-badge ${aiClass}">${aiSource}</span></span>
+                <span style="min-width:50px;text-align:right;font-weight:bold;color:#667eea">${Math.round(item.rank_score || 0)}</span>
+                <button class="pin-btn ${pinned ? 'pinned' : ''}" onclick="togglePin('${item.ticker}', event)" style="min-width:30px;text-align:center">📌</button>
+            </div>
+        `;
+    });
+    
+    container.innerHTML += '</div>';
+}
+
+function renderNewsFeed(container) {
+    container.innerHTML = `
+        <div style="margin-bottom:12px">
+            <h3 style="font-size:16px;margin-bottom:8px">📰 Live News Feed</h3>
+            <div style="font-size:11px;color:#888">${newsFeed.length} recent news items from 11 sources</div>
+        </div>
+        <div class="news-feed">
+            ${newsFeed.length > 0 ? newsFeed.slice(0, 150).map(n => `
+                <div class="news-item">
+                    <div style="font-size:12px">${n.headline || 'No headline'}</div>
+                    <div style="display:flex;gap:8px;font-size:9px;color:#666;margin-top:2px">
+                        <span>📰 ${n.source || 'Unknown'}</span>
+                        <span>Sentiment: ${n.sentiment?.label || 'NEUTRAL'}</span>
+                        ${n.time ? `<span>🕐 ${n.time}</span>` : ''}
+                    </div>
+                </div>
+            `).join('') : '<div style="color:#666;padding:20px;text-align:center">No news available</div>'}
+        </div>
+    `;
+}
+
+function updateStats() {
+    document.getElementById('totalStocks').textContent = allData.length;
+    const buys = allData.filter(d => d.recommendation && d.recommendation.includes('BUY')).length;
+    const watches = allData.filter(d => d.recommendation === 'WATCH').length;
+    const sells = allData.filter(d => d.recommendation === 'SELL' || d.recommendation === 'AVOID').length;
+    document.getElementById('buyCount').textContent = buys;
+    document.getElementById('watchCount').textContent = watches;
+    document.getElementById('sellCount').textContent = sells;
+    document.getElementById('pinnedCount').textContent = pinnedStocks.length;
+}
+
+function filterCards() { renderCards(); }
+
+function setSector(sector) {
+    currentSector = sector;
+    document.querySelectorAll('[data-sector]').forEach(b => b.classList.toggle('active', b.dataset.sector === sector));
+    currentOffset = 0;
+    allData = [];
+    refreshData();
+}
+
+function toggleAI() {
+    useAI = document.getElementById('aiToggle').checked;
+    currentOffset = 0;
+    allData = [];
+    refreshData();
+}
+
+// ============================================================
+// EXPORT DATA
+// ============================================================
+
+async function exportData() {
+    if (allData.length === 0) {
+        alert('No data to export.');
+        return;
+    }
+    try {
+        const response = await fetch('/api/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ results: allData, format: 'csv' })
+        });
+        if (response.ok) {
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `stock_analysis_${new Date().toISOString().slice(0,10)}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        }
+    } catch(err) {
+        alert('Error exporting: ' + err.message);
+    }
+}
+
+// ============================================================
+// MODAL FUNCTIONS
+// ============================================================
+
+function openModal(item) {
+    currentModalTicker = item.ticker;
+    document.getElementById('modalTicker').textContent = item.ticker;
+    document.getElementById('modalCompany').textContent = item.company + ' • ' + item.sector;
+    const direction = item.price_direction || (item.change_1d > 0 ? 'UP' : 'DOWN');
+    const directionClass = direction === 'UP' ? 'direction-up' : 'direction-down';
+    document.getElementById('modalDirection').textContent = `${direction} ${direction === 'UP' ? '▲' : '▼'} (${item.change_1d?.toFixed(1)}%)`;
+    document.getElementById('modalDirection').className = directionClass;
+    
+    const trendDisplay = item.trend || 'NEUTRAL';
+    const trendClass = trendDisplay.includes('BULLISH') ? 'trend-bullish' : trendDisplay.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
+    document.getElementById('modalTrend').textContent = `📊 ${trendDisplay}`;
+    document.getElementById('modalTrend').className = trendClass;
+    
+    const stats = [
+        { label: 'Price', value: '$' + (item.price?.toFixed(2) || 'N/A') },
+        { label: 'Change', value: (item.change_1d?.toFixed(1) || '0.0') + '%', class: item.change_1d >= 0 ? 'positive' : 'negative' },
+        { label: 'RSI', value: item.rsi || 'N/A' },
+        { label: 'Volume Ratio', value: item.volume_ratio?.toFixed(2) || 'N/A' },
+        { label: 'Momentum', value: (item.momentum_score || 50) + '%' },
+        { label: 'P/E', value: item.pe_ratio || 'N/A' },
+        { label: 'SMA20', value: '$' + (item.sma20?.toFixed(2) || 'N/A') },
+        { label: 'SMA50', value: '$' + (item.sma50?.toFixed(2) || 'N/A') },
+        { label: 'Price vs SMA20', value: item.price_vs_sma20 || 'N/A', class: item.price_vs_sma20 === 'ABOVE' ? 'trend-bullish' : 'trend-bearish' },
+        { label: 'Recommendation', value: item.recommendation || 'WATCH' },
+        { label: 'Confidence', value: item.confidence + '%' },
+        { label: 'Source', value: item.ai_source || item.source || 'Technical' },
+        { label: 'News', value: item.news_count || 0 },
+        { label: 'Sentiment', value: (item.sentiment_aggregate || 0).toFixed(2) },
+        { label: 'Rank Score', value: Math.round(item.rank_score || 0) }
+    ];
+    
+    const modalStats = document.getElementById('modalStats');
+    modalStats.innerHTML = '';
+    stats.forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'modal-stat';
+        div.innerHTML = `<div class="label">${s.label}</div><div class="value ${s.class || ''}">${s.value}</div>`;
+        modalStats.appendChild(div);
+    });
+    
+    if (chart) chart.destroy();
+    const ctx = document.getElementById('modalChart').getContext('2d');
+    const hist = item.historical;
+    if (hist && hist.dates && hist.dates.length > 0) {
+        chart = new Chart(ctx, {
+            type: 'line',
+            data: { 
+                labels: hist.dates, 
+                datasets: [{ label: 'Price', data: hist.prices, borderColor: '#667eea', backgroundColor: 'rgba(102,126,234,0.1)', fill: true, tension: 0.4, pointRadius: 0 }]
+            },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true, labels: { color: '#888', font: { size: 9 } } } } }
+        });
+    }
+    
+    const modalNews = document.getElementById('modalNews');
+    modalNews.innerHTML = '';
+    if (item.news_items && item.news_items.length > 0) {
+        modalNews.innerHTML = '<div style="font-weight:bold;color:#667eea;margin-bottom:6px">📰 Recent News</div>';
+        item.news_items.slice(0, 5).forEach(n => {
+            const div = document.createElement('div');
+            div.style.cssText = 'padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:11px;color:#aaa';
+            const emoji = n.sentiment === 'BULLISH' ? '🟢' : n.sentiment === 'BEARISH' ? '🔴' : '🟡';
+            div.innerHTML = `${emoji} [${n.source}] ${n.headline?.substring(0, 150) || ''}...`;
+            modalNews.appendChild(div);
+        });
+    } else {
+        modalNews.innerHTML = '<div style="color:#666;padding:10px">No news available</div>';
+    }
+    
+    document.getElementById('quickTradeInfo').textContent = '';
+    document.getElementById('detailModal').classList.add('active');
+}
+
+function closeModal() {
+    document.getElementById('detailModal').classList.remove('active');
+    if (chart) { chart.destroy(); chart = null; }
+}
+
+document.getElementById('detailModal').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+
+const savedTheme = localStorage.getItem('darkMode');
+if (savedTheme === 'false') {
+    darkMode = false;
+    document.body.style.background = 'linear-gradient(135deg,#f5f7fa,#c3cfe2)';
+    document.body.style.color = '#1a1a2e';
+    document.querySelector('.theme-toggle').textContent = '☀️';
+}
+
+loadSettings();
+refreshData();
+</script>
+</body>
+</html>
+"""
+
+# ============================================================
+# RUN THE APP - RAILWAY COMPATIBLE
 # ============================================================
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
     print("\n" + "="*80)
-    print("🚀 AI Stock Analyzer Pro - COMPLETE WITH PAPER TRADING")
+    print("🚀 AI Stock Analyzer Pro - COMPLETE WITH PAPER TRADING (FIXED)")
     print("="*80)
     print(f"📈 Total Stocks: {len(ALL_STOCKS)}")
     print(f"📰 News Sources: {len(NEWS_SOURCES)} (ALL 11 WORKING)")
     print(f"🤖 OpenAI: {'✅ Available' if openai_client else '❌ Not available'}")
     print(f"🤖 Claude: {'✅ Available' if claude_client else '❌ Not available'}")
     print(f"🤖 Groq: {'✅ Available' if groq_client else '❌ Not available'}")
+    print(f"🌐 Running on port: {port}")
     print("="*80)
-    print(f"🌐 Starting server on port {port}")
+    print("📊 FIXES & NEW FEATURES:")
+    print("   ✅ ALL 11 News Sources working")
+    print("   ✅ MPC and other uptrend stocks get BUY recommendations")
+    print("   ✅ Enhanced scoring - more BUY opportunities")
+    print("   ✅ PAPER TRADING - Simulate buying/selling with $10,000")
+    print("   ✅ ACCURATE CALCULATIONS - Cash, Holdings Value, Total Value")
+    print("   ✅ Total P&L tracking with percentage")
+    print("   ✅ Transaction history with timestamps")
+    print("   ✅ Portfolio value caching for performance")
+    print("   ✅ Performance history tracking")
+    print("   ✅ Quick trade buttons in stock detail modal")
+    print("   ✅ Visual bullish/downtrend highlights")
+    print("   ✅ Balanced recommendations (not all SELL/AVOID)")
+    print("   ✅ RAILWAY COMPATIBLE - Uses /tmp for database")
+    print("   ✅ Health check endpoint at /health")
+    print("="*80)
+    print("💼 PAPER TRADING FEATURES:")
+    print("   • Start with $10,000 virtual cash")
+    print("   • Buy/Sell stocks at real market prices")
+    print("   • Track portfolio value and P&L")
+    print("   • Reset account anytime")
+    print("   • Quick trade from any stock's detail view")
+    print("   • Transaction history with P&L per trade")
+    print("   • Portfolio performance tracking over time")
+    print("="*80)
+    if not openai_client:
+        print("⚠️ OpenAI not available. To fix:")
+        print("   1. Add OPENAI_API_KEY=your_key to .env file")
+        print("   2. Install openai: pip install openai")
+        print("   3. Restart the server")
+        print("="*80)
+    print("🌐 http://localhost:" + str(port))
     print("="*80 + "\n")
     app.run(debug=False, host='0.0.0.0', port=port)
