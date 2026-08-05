@@ -19,9 +19,12 @@ import numpy as np
 from collections import deque
 import random
 import logging
-from textblob import TextBlob
 import sqlite3
 from pathlib import Path
+
+# ============================================================
+# NO TEXTBLOB - Using custom sentiment analysis instead
+# ============================================================
 
 # OpenAI imports
 try:
@@ -42,7 +45,60 @@ load_dotenv()
 app = Flask(__name__)
 
 # ============================================================
-# DATABASE FOR PAPER TRADING - FIXED FOR RAILWAY
+# SENTIMENT ANALYSIS - Custom implementation (no TextBlob)
+# ============================================================
+
+def get_sentiment_analysis(text):
+    """Custom sentiment analysis without TextBlob/NLTK"""
+    if not text:
+        return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
+    
+    # Extensive keyword lists
+    very_positive = ['bullish', 'surge', 'soar', 'rocket', 'breakout', 'record high', 
+                     'outperform', 'strong buy', 'upgrade', 'beating', 'exceed']
+    positive = ['up', 'gain', 'positive', 'good', 'great', 'excellent', 'growth', 
+                'profit', 'beat', 'rally', 'strong', 'opportunity', 'win', 'success',
+                'higher', 'rise', 'jump', 'climb', 'advance', 'improve', 'boost']
+    very_negative = ['bearish', 'crash', 'plunge', 'tumble', 'collapse', 'downgrade',
+                     'underperform', 'strong sell', 'miss', 'disaster', 'terrible']
+    negative = ['down', 'loss', 'negative', 'bad', 'poor', 'decline', 'drop', 
+                'fall', 'weak', 'risk', 'danger', 'failure', 'problem', 'low',
+                'slip', 'slide', 'struggle', 'worry', 'concern']
+    
+    text_lower = text.lower()
+    
+    # Count weighted keywords
+    vp_count = sum(1 for word in very_positive if word in text_lower)
+    p_count = sum(1 for word in positive if word in text_lower)
+    vn_count = sum(1 for word in very_negative if word in text_lower)
+    n_count = sum(1 for word in negative if word in text_lower)
+    
+    # Weighted score
+    score = (vp_count * 2 + p_count - n_count - vn_count * 2)
+    
+    # Normalize
+    total = vp_count + p_count + vn_count + n_count
+    if total == 0:
+        return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
+    
+    normalized_score = max(-1, min(1, score / (total * 2)))
+    confidence = min(100, (total / 10) * 100 + 10)
+    
+    if normalized_score > 0.2:
+        label = "BULLISH" if normalized_score > 0.5 else "POSITIVE"
+    elif normalized_score < -0.2:
+        label = "BEARISH" if normalized_score < -0.5 else "NEGATIVE"
+    else:
+        label = "NEUTRAL"
+    
+    return {
+        'label': label,
+        'score': round(normalized_score, 2),
+        'confidence': round(confidence, 2)
+    }
+
+# ============================================================
+# DATABASE FOR PAPER TRADING
 # ============================================================
 
 class PaperTradingDB:
@@ -791,7 +847,7 @@ class EnhancedNewsScraper:
         return list(self.news_history)[-limit:]
 
 # ============================================================
-# AI ANALYSIS ENGINE
+# AI ANALYSIS ENGINE - Using custom sentiment (no TextBlob)
 # ============================================================
 
 class AIAnalysisEngine:
@@ -802,24 +858,8 @@ class AIAnalysisEngine:
         self.last_ai_source = None
         
     def get_ai_sentiment(self, text):
-        if not text:
-            return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
-        try:
-            blob = TextBlob(text)
-            polarity = blob.sentiment.polarity
-            if polarity > 0.3:
-                label = "BULLISH" if polarity > 0.6 else "POSITIVE"
-            elif polarity < -0.3:
-                label = "BEARISH" if polarity < -0.6 else "NEGATIVE"
-            else:
-                label = "NEUTRAL"
-            return {
-                'label': label,
-                'score': round(polarity, 2),
-                'confidence': min(100, abs(polarity) * 50 + 20)
-            }
-        except:
-            return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
+        """Get sentiment using custom analyzer (no TextBlob)"""
+        return get_sentiment_analysis(text)
     
     def get_ai_analysis(self, ticker, company, yahoo_data, sentiment_score, news_data):
         cache_key = f"{ticker}_{datetime.now().strftime('%Y-%m-%d-%H')}"
@@ -1001,10 +1041,6 @@ Return ONLY valid JSON with this format:
         price_vs_sma50 = yahoo_data.get('price_vs_sma50', 'BELOW')
         consecutive_down = yahoo_data.get('consecutive_down_days', 0)
         volume_ratio = yahoo_data.get('volume_ratio', 1)
-        
-        # ============================================================
-        # ENHANCED SCORING - More BUY opportunities
-        # ============================================================
         
         # 1. PRICE DIRECTION - PRIMARY (weighted heavily)
         if change > 0:
@@ -1593,10 +1629,6 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis):
     trend = data.get('trend', 'NEUTRAL')
     volume_ratio = data.get('volume_ratio', 1)
     
-    # ============================================================
-    # ENHANCED SCORING - Prioritizes upward momentum
-    # ============================================================
-    
     # 1. PRICE DIRECTION - PRIMARY
     if change > 0:
         if change > 3:
@@ -2006,7 +2038,7 @@ def export_data():
     )
 
 # ============================================================
-# PAPER TRADING ROUTES - UPDATED WITH FIXES
+# PAPER TRADING ROUTES
 # ============================================================
 
 @app.route('/api/paper/status', methods=['GET'])
@@ -2015,7 +2047,6 @@ def paper_status():
     portfolio_value = paper_trading.get_portfolio_value(user_id)
     transactions = paper_trading.get_transactions(user_id)
     
-    # Get recent transactions for display
     recent_trades = []
     for t in transactions[:5]:
         recent_trades.append({
@@ -2045,7 +2076,6 @@ def paper_buy():
     if not ticker or shares <= 0:
         return jsonify({'success': False, 'error': 'Invalid input'}), 400
     
-    # Validate ticker exists
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1d")
@@ -2058,7 +2088,6 @@ def paper_buy():
     user_id, _ = paper_trading.get_or_create_user()
     success, message = paper_trading.buy_stock(user_id, ticker, shares, price)
     
-    # Get updated portfolio
     portfolio = paper_trading.get_portfolio_value(user_id)
     
     return jsonify({
@@ -2080,7 +2109,6 @@ def paper_sell():
     if not ticker or shares <= 0:
         return jsonify({'success': False, 'error': 'Invalid input'}), 400
     
-    # Validate ticker exists
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1d")
@@ -2093,7 +2121,6 @@ def paper_sell():
     user_id, _ = paper_trading.get_or_create_user()
     success, message = paper_trading.sell_stock(user_id, ticker, shares, price)
     
-    # Get updated portfolio
     portfolio = paper_trading.get_portfolio_value(user_id)
     
     return jsonify({
@@ -2119,7 +2146,6 @@ def paper_reset():
     conn.commit()
     conn.close()
     
-    # Clear cache
     if user_id in paper_trading.cache:
         del paper_trading.cache[user_id]
     
@@ -2163,7 +2189,7 @@ def status():
     })
 
 # ============================================================
-# HTML TEMPLATE - UPDATED WITH PAPER TRADING FIXES
+# HTML TEMPLATE (keep your existing HTML_TEMPLATE here)
 # ============================================================
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -2589,7 +2615,7 @@ let sortDescending = true;
 let currentModalTicker = '';
 
 // ============================================================
-// PAPER TRADING FUNCTIONS - UPDATED
+// PAPER TRADING FUNCTIONS
 // ============================================================
 
 async function updatePaperStatus() {
@@ -2599,18 +2625,15 @@ async function updatePaperStatus() {
         if (data.success) {
             const portfolio = data.portfolio;
             
-            // Update main stats
             document.getElementById('paperCash').textContent = '$' + portfolio.cash.toFixed(2);
             document.getElementById('paperValue').textContent = '$' + portfolio.total_holdings_value.toFixed(2);
             document.getElementById('paperTotal').textContent = '$' + portfolio.total_value.toFixed(2);
             
-            // Update P&L
             const pl = portfolio.total_profit_loss || 0;
             const plElement = document.getElementById('paperPL');
             plElement.textContent = (pl >= 0 ? '+' : '') + '$' + pl.toFixed(2);
             plElement.style.color = pl >= 0 ? '#4CAF50' : '#f44336';
             
-            // Update portfolio list
             const list = document.getElementById('portfolioList');
             if (portfolio.holdings && portfolio.holdings.length > 0) {
                 list.innerHTML = portfolio.holdings.map(h => `
@@ -2629,7 +2652,6 @@ async function updatePaperStatus() {
                 list.innerHTML = '<div style="color:#666;font-size:11px;padding:8px 0">No holdings</div>';
             }
             
-            // Update transactions
             const transList = document.getElementById('transactionList');
             if (data.transactions && data.transactions.length > 0) {
                 transList.innerHTML = data.transactions.slice(0, 10).map(t => `
@@ -3079,7 +3101,6 @@ function renderCards() {
         return true;
     });
     
-    // Tab-specific filtering
     if (currentTab === 'pinned') {
         filtered = filtered.filter(item => isPinned(item.ticker));
     } else if (currentTab === 'gainers') {
@@ -3092,7 +3113,6 @@ function renderCards() {
         filtered = filtered.filter(item => item.trend && (item.trend.includes('BEARISH') || item.trend.includes('DOWNTREND')));
     }
     
-    // Apply sorting
     if (currentSort && currentTab !== 'gainers' && currentTab !== 'losers') {
         filtered.sort((a, b) => {
             let va = a[currentSort] ?? 0;
@@ -3442,7 +3462,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
     print("\n" + "="*80)
-    print("🚀 AI Stock Analyzer Pro - COMPLETE WITH PAPER TRADING (FIXED)")
+    print("🚀 AI Stock Analyzer Pro - COMPLETE WITH PAPER TRADING")
     print("="*80)
     print(f"📈 Total Stocks: {len(ALL_STOCKS)}")
     print(f"📰 News Sources: {len(NEWS_SOURCES)} (ALL 11 WORKING)")
@@ -3463,6 +3483,7 @@ if __name__ == '__main__':
     print("   ✅ Quick trade buttons in stock detail modal")
     print("   ✅ Visual bullish/downtrend highlights")
     print("   ✅ Balanced recommendations (not all SELL/AVOID)")
+    print("   ✅ NO TextBlob dependency - custom sentiment analysis")
     print("   ✅ Railway deployment ready")
     print("   ✅ Health check endpoint")
     print("   ✅ Persistent storage with Railway volume")
