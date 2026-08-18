@@ -13,3 +13,4 @@ google-generativeai>=0.3.0
 anthropic>=0.7.0
 groq>=0.4.0
 gunicorn>=21.2.0
+textblob==0.17.1
