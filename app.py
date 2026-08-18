@@ -1,30 +1,9 @@
-#!/usr/bin/env python
-import os
-import sys
-
-# CRITICAL FIX FOR RAILWAY - Set this before ANYTHING else
-os.environ['PYTHONSAFEPATH'] = '1'
-
-# Remove current directory from path to prevent import issues
-if '' in sys.path:
-    sys.path.remove('')
-if '.' in sys.path:
-    sys.path.remove('.')
-
-# Force the correct site-packages path
-site_packages = '/app/.venv/lib/python3.11/site-packages'
-if site_packages not in sys.path:
-    sys.path.insert(0, site_packages)
-
-# ============================================================
-# ALL IMPORTS - TextBlob REMOVED, using VADER instead
-# ============================================================
-
 from flask import Flask, jsonify, render_template_string, request, send_file
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import time
+import os
 import json
 import requests
 import io
@@ -35,278 +14,120 @@ import threading
 import feedparser
 from bs4 import BeautifulSoup
 import re
+import hashlib
 import numpy as np
 from collections import deque
 import random
 import logging
+from textblob import TextBlob
 import sqlite3
 from pathlib import Path
-from sklearn.linear_model import LinearRegression
 
-# OpenAI imports with graceful failure
+# OpenAI imports
 try:
     import openai
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
-    print("⚠️ OpenAI not installed")
-
-# Gemini imports
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠️ Gemini not installed")
+    print("⚠️ OpenAI not installed. Install with: pip install openai")
 
 warnings.filterwarnings('ignore')
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('anthropic').setLevel(logging.ERROR)
 logging.getLogger('groq').setLevel(logging.ERROR)
 logging.getLogger('openai').setLevel(logging.ERROR)
-logging.getLogger('httpx').setLevel(logging.WARNING)
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
 
 # ============================================================
-# RAILWAY-SPECIFIC FIXES
-# ============================================================
-
-IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
-
-if IS_RAILWAY:
-    DB_PATH = '/tmp/paper_trading.db'
-else:
-    DB_PATH = 'paper_trading.db'
-
-PORT = int(os.environ.get('PORT', 5000))
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ============================================================
-# API KEYS
-# ============================================================
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-
-# ============================================================
-# AI CLIENTS WITH RATE LIMITING
-# ============================================================
-
-openai_client = None
-claude_client = None
-groq_client = None
-gemini_client = None
-GROQ_RATE_LIMITED = False
-GROQ_LIMIT_RESET_TIME = None
-OPENAI_RATE_LIMITED = False
-OPENAI_LIMIT_RESET_TIME = None
-
-# Rate limiting counters
-_ai_call_counter = 0
-_ai_call_reset_time = datetime.now()
-_ai_call_lock = threading.Lock()
-
-def check_ai_rate_limit():
-    """Global AI rate limiter - max 100 calls per minute across all services"""
-    global _ai_call_counter, _ai_call_reset_time
-    with _ai_call_lock:
-        now = datetime.now()
-        if (now - _ai_call_reset_time).seconds >= 60:
-            _ai_call_counter = 0
-            _ai_call_reset_time = now
-        if _ai_call_counter >= 100:
-            return False
-        _ai_call_counter += 1
-        return True
-
-if OPENAI_API_KEY and OPENAI_AVAILABLE:
-    try:
-        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY, max_retries=0)
-        logger.info("✓ OpenAI ready")
-    except Exception as e:
-        logger.warning(f"⚠️ OpenAI error: {e}")
-
-if GEMINI_API_KEY and GEMINI_AVAILABLE:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_client = genai.GenerativeModel('gemini-pro')
-        logger.info("✓ Gemini ready")
-    except Exception as e:
-        logger.warning(f"⚠️ Gemini error: {e}")
-
-try:
-    from anthropic import Anthropic
-    if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "your-anthropic-api-key-here":
-        claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        logger.info("✓ Claude ready")
-except:
-    claude_client = None
-
-try:
-    from groq import Groq
-    if GROQ_API_KEY:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info("✓ Groq ready")
-except:
-    groq_client = None
-
-def is_groq_rate_limited():
-    global GROQ_RATE_LIMITED, GROQ_LIMIT_RESET_TIME
-    if GROQ_RATE_LIMITED and GROQ_LIMIT_RESET_TIME:
-        if datetime.now() > GROQ_LIMIT_RESET_TIME:
-            GROQ_RATE_LIMITED = False
-            GROQ_LIMIT_RESET_TIME = None
-            return False
-        return True
-    return False
-
-def mark_groq_rate_limited():
-    global GROQ_RATE_LIMITED, GROQ_LIMIT_RESET_TIME
-    if not GROQ_RATE_LIMITED:
-        GROQ_RATE_LIMITED = True
-        GROQ_LIMIT_RESET_TIME = datetime.now() + timedelta(minutes=10)
-        logger.warning(f"⚠️ Groq rate limited until {GROQ_LIMIT_RESET_TIME}")
-
-def is_openai_rate_limited():
-    global OPENAI_RATE_LIMITED, OPENAI_LIMIT_RESET_TIME
-    if OPENAI_RATE_LIMITED and OPENAI_LIMIT_RESET_TIME:
-        if datetime.now() > OPENAI_LIMIT_RESET_TIME:
-            OPENAI_RATE_LIMITED = False
-            OPENAI_LIMIT_RESET_TIME = None
-            return False
-        return True
-    return False
-
-def mark_openai_rate_limited():
-    global OPENAI_RATE_LIMITED, OPENAI_LIMIT_RESET_TIME
-    if not OPENAI_RATE_LIMITED:
-        OPENAI_RATE_LIMITED = True
-        OPENAI_LIMIT_RESET_TIME = datetime.now() + timedelta(minutes=5)
-        logger.warning(f"⚠️ OpenAI rate limited until {OPENAI_LIMIT_RESET_TIME}")
-
-# ============================================================
-# DATABASE
+# DATABASE FOR PAPER TRADING - FIXED
 # ============================================================
 
 class PaperTradingDB:
     def __init__(self):
-        self.db_path = Path(DB_PATH)
-        self._lock = threading.Lock()
+        self.db_path = Path('paper_trading.db')
         self.init_db()
-        self.cache = {}
-    
-    def _get_conn(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        return conn
+        self.cache = {}  # Cache for portfolio values to avoid repeated API calls
     
     def init_db(self):
-        with self._lock:
-            conn = self._get_conn()
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE,
-                    cash REAL DEFAULT 10000,
-                    total_profit REAL DEFAULT 0,
-                    total_trades INTEGER DEFAULT 0,
-                    winning_trades INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS portfolio (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    ticker TEXT,
-                    shares REAL,
-                    avg_price REAL,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    ticker TEXT,
-                    type TEXT,
-                    shares REAL,
-                    price REAL,
-                    total REAL,
-                    profit_loss REAL DEFAULT 0,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS performance_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    total_value REAL,
-                    cash REAL,
-                    holdings_value REAL,
-                    total_profit REAL DEFAULT 0,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            cursor.execute("PRAGMA table_info(users)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'total_profit' not in columns:
-                cursor.execute('ALTER TABLE users ADD COLUMN total_profit REAL DEFAULT 0')
-            if 'total_trades' not in columns:
-                cursor.execute('ALTER TABLE users ADD COLUMN total_trades INTEGER DEFAULT 0')
-            if 'winning_trades' not in columns:
-                cursor.execute('ALTER TABLE users ADD COLUMN winning_trades INTEGER DEFAULT 0')
-            
-            cursor.execute("PRAGMA table_info(transactions)")
-            trans_columns = [col[1] for col in cursor.fetchall()]
-            if 'profit_loss' not in trans_columns:
-                cursor.execute('ALTER TABLE transactions ADD COLUMN profit_loss REAL DEFAULT 0')
-            
-            conn.commit()
-            conn.close()
-    
-    def get_or_create_user(self, username='default'):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('SELECT user_id, cash, total_profit, total_trades, winning_trades FROM users WHERE username = ?', (username,))
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE,
+                cash REAL DEFAULT 10000,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Portfolio table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                ticker TEXT,
+                shares REAL,
+                avg_price REAL,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Transactions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                ticker TEXT,
+                type TEXT,
+                shares REAL,
+                price REAL,
+                total REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Performance history table for tracking portfolio over time
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS performance_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                total_value REAL,
+                cash REAL,
+                holdings_value REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_or_create_user(self, username='default'):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT user_id, cash FROM users WHERE username = ?', (username,))
         result = cursor.fetchone()
         
         if result:
-            user_id, cash, total_profit, total_trades, winning_trades = result
+            user_id, cash = result
         else:
-            cursor.execute('INSERT INTO users (username, cash, total_profit, total_trades, winning_trades) VALUES (?, ?, ?, ?, ?)', 
-                         (username, 10000, 0, 0, 0))
+            cursor.execute('INSERT INTO users (username, cash) VALUES (?, ?)', (username, 10000))
             conn.commit()
             user_id = cursor.lastrowid
             cash = 10000
-            total_profit = 0
-            total_trades = 0
-            winning_trades = 0
         
         conn.close()
-        return user_id, cash, total_profit, total_trades, winning_trades
+        return user_id, cash
     
     def get_portfolio(self, user_id):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT ticker, shares, avg_price FROM portfolio WHERE user_id = ?', (user_id,))
         results = cursor.fetchall()
@@ -314,10 +135,10 @@ class PaperTradingDB:
         return [{'ticker': r[0], 'shares': r[1], 'avg_price': r[2]} for r in results]
     
     def get_transactions(self, user_id, limit=50):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT ticker, type, shares, price, total, profit_loss, timestamp 
+            SELECT ticker, type, shares, price, total, timestamp 
             FROM transactions 
             WHERE user_id = ? 
             ORDER BY timestamp DESC 
@@ -325,27 +146,26 @@ class PaperTradingDB:
         ''', (user_id, limit))
         results = cursor.fetchall()
         conn.close()
-        return [{'ticker': r[0], 'type': r[1], 'shares': r[2], 'price': r[3], 'total': r[4], 'profit_loss': r[5], 'timestamp': r[6]} for r in results]
+        return [{'ticker': r[0], 'type': r[1], 'shares': r[2], 'price': r[3], 'total': r[4], 'timestamp': r[5]} for r in results]
     
     def buy_stock(self, user_id, ticker, shares, price):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         total_cost = shares * price
         
+        # Check cash
         cursor.execute('SELECT cash FROM users WHERE user_id = ?', (user_id,))
-        cash_row = cursor.fetchone()
-        if not cash_row:
-            conn.close()
-            return False, "User not found"
-        cash = cash_row[0]
+        cash = cursor.fetchone()[0]
         
         if cash < total_cost:
             conn.close()
             return False, f"Insufficient funds. Need ${total_cost:.2f}, have ${cash:.2f}"
         
+        # Update cash
         cursor.execute('UPDATE users SET cash = cash - ? WHERE user_id = ?', (total_cost, user_id))
         
+        # Update portfolio
         cursor.execute('SELECT shares, avg_price FROM portfolio WHERE user_id = ? AND ticker = ?', (user_id, ticker))
         holding = cursor.fetchone()
         
@@ -364,25 +184,26 @@ class PaperTradingDB:
                 VALUES (?, ?, ?, ?)
             ''', (user_id, ticker, shares, price))
         
+        # Record transaction
         cursor.execute('''
-            INSERT INTO transactions (user_id, ticker, type, shares, price, total, profit_loss)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, ticker, 'BUY', shares, price, total_cost, 0))
-        
-        cursor.execute('UPDATE users SET total_trades = total_trades + 1 WHERE user_id = ?', (user_id,))
+            INSERT INTO transactions (user_id, ticker, type, shares, price, total)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, ticker, 'BUY', shares, price, total_cost))
         
         conn.commit()
         conn.close()
         
+        # Clear cache for this user
         if user_id in self.cache:
             del self.cache[user_id]
         
         return True, f"Bought {shares} shares of {ticker} at ${price:.2f} (Total: ${total_cost:.2f})"
     
     def sell_stock(self, user_id, ticker, shares, price):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Check holdings
         cursor.execute('SELECT shares, avg_price FROM portfolio WHERE user_id = ? AND ticker = ?', (user_id, ticker))
         holding = cursor.fetchone()
         
@@ -397,36 +218,35 @@ class PaperTradingDB:
             return False, f"Insufficient shares. You have {existing_shares}, trying to sell {shares}"
         
         total_value = shares * price
-        profit_loss = (price - avg_price) * shares
         
+        # Update cash
         cursor.execute('UPDATE users SET cash = cash + ? WHERE user_id = ?', (total_value, user_id))
-        cursor.execute('UPDATE users SET total_profit = total_profit + ? WHERE user_id = ?', (profit_loss, user_id))
         
-        if profit_loss > 0:
-            cursor.execute('UPDATE users SET winning_trades = winning_trades + 1 WHERE user_id = ?', (user_id,))
-        
+        # Update portfolio
         new_shares = existing_shares - shares
         if new_shares == 0:
             cursor.execute('DELETE FROM portfolio WHERE user_id = ? AND ticker = ?', (user_id, ticker))
         else:
             cursor.execute('UPDATE portfolio SET shares = ? WHERE user_id = ? AND ticker = ?', (new_shares, user_id, ticker))
         
+        # Record transaction
         cursor.execute('''
-            INSERT INTO transactions (user_id, ticker, type, shares, price, total, profit_loss)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, ticker, 'SELL', shares, price, total_value, profit_loss))
-        
-        cursor.execute('UPDATE users SET total_trades = total_trades + 1 WHERE user_id = ?', (user_id,))
+            INSERT INTO transactions (user_id, ticker, type, shares, price, total)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, ticker, 'SELL', shares, price, total_value))
         
         conn.commit()
         conn.close()
         
+        # Clear cache for this user
         if user_id in self.cache:
             del self.cache[user_id]
         
+        profit_loss = (price - avg_price) * shares
         return True, f"Sold {shares} shares of {ticker} at ${price:.2f} (P/L: ${profit_loss:.2f})"
     
     def get_portfolio_value(self, user_id):
+        # Check cache first (5 second TTL)
         if user_id in self.cache:
             cache_time, data = self.cache[user_id]
             if (datetime.now() - cache_time).seconds < 5:
@@ -434,14 +254,11 @@ class PaperTradingDB:
         
         portfolio = self.get_portfolio(user_id)
         
-        conn = self._get_conn()
+        # Get cash
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('SELECT cash, total_profit, total_trades, winning_trades FROM users WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return self._empty_portfolio()
-        cash, total_profit, total_trades, winning_trades = row
+        cursor.execute('SELECT cash FROM users WHERE user_id = ?', (user_id,))
+        cash = cursor.fetchone()[0]
         conn.close()
         
         holdings = []
@@ -453,7 +270,7 @@ class PaperTradingDB:
                 stock = yf.Ticker(item['ticker'])
                 hist = stock.history(period="1d")
                 if not hist.empty:
-                    current_price = float(hist['Close'].iloc[-1])
+                    current_price = hist['Close'].iloc[-1]
                     current_value = current_price * item['shares']
                     cost_basis = item['avg_price'] * item['shares']
                     
@@ -474,7 +291,8 @@ class PaperTradingDB:
                         'profit_loss_pct': profit_loss_pct
                     })
             except Exception as e:
-                logger.error(f"⚠️ Error getting price for {item['ticker']}: {e}")
+                print(f"⚠️ Error getting price for {item['ticker']}: {e}")
+                # Use avg_price as fallback
                 current_value = item['avg_price'] * item['shares']
                 total_holdings_value += current_value
                 total_cost_basis += current_value
@@ -489,7 +307,9 @@ class PaperTradingDB:
                     'profit_loss_pct': 0
                 })
         
+        # Calculate total portfolio value
         total_value = cash + total_holdings_value
+        total_profit_loss = total_holdings_value - total_cost_basis
         
         result = {
             'cash': cash,
@@ -497,35 +317,24 @@ class PaperTradingDB:
             'total_holdings_value': total_holdings_value,
             'total_cost_basis': total_cost_basis,
             'total_value': total_value,
-            'total_profit': total_profit,
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'win_rate': (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            'total_profit_loss': total_profit_loss,
+            'total_profit_loss_pct': (total_profit_loss / total_cost_basis * 100) if total_cost_basis > 0 else 0
         }
         
+        # Cache the result
         self.cache[user_id] = (datetime.now(), result)
+        
+        # Save performance history (every 5 minutes)
         self._save_performance_history(user_id, result)
         
         return result
     
-    def _empty_portfolio(self):
-        return {
-            'cash': 10000,
-            'holdings': [],
-            'total_holdings_value': 0,
-            'total_cost_basis': 0,
-            'total_value': 10000,
-            'total_profit': 0,
-            'total_trades': 0,
-            'winning_trades': 0,
-            'win_rate': 0
-        }
-    
     def _save_performance_history(self, user_id, portfolio_data):
         try:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
+            # Check if we already have a record for this minute
             current_minute = datetime.now().strftime('%Y-%m-%d %H:%M:00')
             cursor.execute('''
                 SELECT COUNT(*) FROM performance_history 
@@ -534,10 +343,9 @@ class PaperTradingDB:
             
             if cursor.fetchone()[0] == 0:
                 cursor.execute('''
-                    INSERT INTO performance_history (user_id, total_value, cash, holdings_value, total_profit)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (user_id, portfolio_data['total_value'], portfolio_data['cash'], 
-                     portfolio_data['total_holdings_value'], portfolio_data.get('total_profit', 0)))
+                    INSERT INTO performance_history (user_id, total_value, cash, holdings_value)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, portfolio_data['total_value'], portfolio_data['cash'], portfolio_data['total_holdings_value']))
                 conn.commit()
             
             conn.close()
@@ -545,10 +353,10 @@ class PaperTradingDB:
             pass
     
     def get_performance_history(self, user_id, days=7):
-        conn = self._get_conn()
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT total_value, cash, holdings_value, total_profit, timestamp 
+            SELECT total_value, cash, holdings_value, timestamp 
             FROM performance_history 
             WHERE user_id = ? AND timestamp > datetime('now', ?)
             ORDER BY timestamp ASC
@@ -560,184 +368,112 @@ class PaperTradingDB:
             'total_value': r[0],
             'cash': r[1],
             'holdings_value': r[2],
-            'total_profit': r[3],
-            'timestamp': r[4]
+            'timestamp': r[3]
         } for r in results]
-
-# ============================================================
-# ALPHA VANTAGE API FUNCTIONS
-# ============================================================
-
-def get_alpha_vantage_price(ticker):
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
     
+    def get_cash(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT cash FROM users WHERE user_id = ?', (user_id,))
+        cash = cursor.fetchone()[0]
+        conn.close()
+        return cash
+
+# ============================================================
+# API KEYS
+# ============================================================
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# ============================================================
+# AI CLIENTS
+# ============================================================
+
+openai_client = None
+claude_client = None
+groq_client = None
+GROQ_RATE_LIMITED = False
+GROQ_LIMIT_RESET_TIME = None
+AI_DISABLED_GLOBALLY = False
+
+# Initialize OpenAI
+if OPENAI_API_KEY and OPENAI_AVAILABLE:
     try:
-        url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if 'Global Quote' in data and data['Global Quote']:
-                quote = data['Global Quote']
-                return {
-                    'price': float(quote.get('05. price', 0)),
-                    'change': float(quote.get('09. change', 0)),
-                    'change_pct': float(quote.get('10. change percent', '0%').replace('%', '')),
-                    'volume': int(quote.get('06. volume', 0))
-                }
+        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        print("✓ OpenAI ready (primary AI)")
     except Exception as e:
-        logger.error(f"⚠️ Alpha Vantage error for {ticker}: {e}")
-    return None
+        print(f"⚠️ OpenAI error: {str(e)[:60]}")
+        openai_client = None
+else:
+    if not OPENAI_API_KEY:
+        print("⚠️ No OpenAI API key found. Add OPENAI_API_KEY to .env file")
 
-def get_alpha_vantage_historical(ticker, days=60):
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
-    
-    try:
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}&outputsize=compact"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if 'Time Series (Daily)' in data:
-                time_series = data['Time Series (Daily)']
-                dates = sorted(time_series.keys(), reverse=True)[:days]
-                dates.reverse()
-                
-                prices = []
-                volumes = []
-                for date in dates:
-                    prices.append(float(time_series[date]['4. close']))
-                    volumes.append(int(time_series[date]['5. volume']))
-                
-                return {
-                    'dates': dates,
-                    'prices': prices,
-                    'volumes': volumes
-                }
-    except Exception as e:
-        logger.error(f"⚠️ Alpha Vantage historical error for {ticker}: {e}")
-    return None
+# Initialize Claude
+try:
+    from anthropic import Anthropic
+    if ANTHROPIC_API_KEY:
+        claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        print("✓ Claude AI ready (fallback)")
+except:
+    claude_client = None
 
-# ============================================================
-# CACHED SPY DATA
-# ============================================================
+# Initialize Groq
+try:
+    from groq import Groq
+    if GROQ_API_KEY:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        print("✓ Groq AI ready (fallback)")
+except:
+    groq_client = None
 
-_spy_cache = {}
-_spy_cache_lock = threading.Lock()
+def is_groq_rate_limited():
+    global GROQ_RATE_LIMITED, GROQ_LIMIT_RESET_TIME
+    if GROQ_RATE_LIMITED and GROQ_LIMIT_RESET_TIME:
+        if datetime.now() > GROQ_LIMIT_RESET_TIME:
+            GROQ_RATE_LIMITED = False
+            GROQ_LIMIT_RESET_TIME = None
+            global AI_DISABLED_GLOBALLY
+            AI_DISABLED_GLOBALLY = False
+            return False
+        return True
+    return False
 
-def get_spy_data():
-    with _spy_cache_lock:
-        now = datetime.now()
-        if 'data' in _spy_cache and (now - _spy_cache.get('time', datetime.min)).seconds < 60:
-            return _spy_cache['data']
-        
-        try:
-            spy = yf.download("SPY", period="2mo", progress=False)
-            if not spy.empty:
-                _spy_cache['data'] = spy
-                _spy_cache['time'] = now
-                return spy
-        except Exception as e:
-            logger.error(f"SPY download error: {e}")
-        return None
+def mark_groq_rate_limited():
+    global GROQ_RATE_LIMITED, GROQ_LIMIT_RESET_TIME, AI_DISABLED_GLOBALLY
+    if not GROQ_RATE_LIMITED:
+        GROQ_RATE_LIMITED = True
+        GROQ_LIMIT_RESET_TIME = datetime.now() + timedelta(minutes=10)
+        AI_DISABLED_GLOBALLY = True
+        print(f"⚠️ Groq rate limited. AI disabled until {GROQ_LIMIT_RESET_TIME.strftime('%H:%M:%S')}")
 
 # ============================================================
-# PRICE PREDICTION ENGINE
-# ============================================================
-
-class PricePredictionEngine:
-    def __init__(self):
-        self.prediction_cache = {}
-        self.cache_ttl = 300
-    
-    def predict_next_day(self, ticker, historical_data):
-        cache_key = f"{ticker}_{datetime.now().strftime('%Y-%m-%d-%H')}"
-        if cache_key in self.prediction_cache:
-            cache_time, data = self.prediction_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
-        try:
-            if not historical_data or len(historical_data.get('prices', [])) < 10:
-                return None
-            
-            prices = historical_data.get('prices', [])
-            if len(prices) < 10:
-                return None
-            
-            recent_prices = prices[-30:]
-            days = np.array(range(len(recent_prices))).reshape(-1, 1)
-            prices_array = np.array(recent_prices).reshape(-1, 1)
-            
-            model = LinearRegression()
-            model.fit(days, prices_array)
-            
-            next_day = np.array([[len(recent_prices)]])
-            predicted_price = model.predict(next_day)[0][0]
-            
-            r2 = model.score(days, prices_array)
-            confidence = min(100, max(50, r2 * 100 + 20))
-            
-            current_price = recent_prices[-1]
-            expected_change = ((predicted_price - current_price) / current_price) * 100
-            
-            if expected_change > 2:
-                prediction = "STRONG BULLISH"
-            elif expected_change > 0.5:
-                prediction = "BULLISH"
-            elif expected_change > -0.5:
-                prediction = "NEUTRAL"
-            elif expected_change > -2:
-                prediction = "BEARISH"
-            else:
-                prediction = "STRONG BEARISH"
-            
-            result = {
-                'predicted_price': round(predicted_price, 2),
-                'current_price': round(current_price, 2),
-                'expected_change': round(expected_change, 2),
-                'confidence': round(confidence, 2),
-                'prediction': prediction,
-                'support': round(min(recent_prices) * 0.97, 2),
-                'resistance': round(max(recent_prices) * 1.03, 2),
-                'trend_strength': 'STRONG' if abs(expected_change) > 2 else 'MODERATE' if abs(expected_change) > 1 else 'WEAK'
-            }
-            
-            self.prediction_cache[cache_key] = (datetime.now(), result)
-            return result
-            
-        except Exception as e:
-            logger.error(f"⚠️ Prediction error for {ticker}: {e}")
-            return None
-
-# ============================================================
-# ENHANCED NEWS SCRAPER - WITH FIXED FEEDFLASH
+# ENHANCED NEWS SCRAPER - ALL 11 SOURCES WORKING
 # ============================================================
 
 class EnhancedNewsScraper:
     def __init__(self):
         self.session = requests.Session()
-        self.timeout = 15
+        self.session.verify = False
+        self.timeout = 3
         self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
         ]
         self.ua_index = 0
         self.scrape_cache = {}
         self.cache_ttl = 180
         self.ai_engine = None
         self.news_history = deque(maxlen=500)
-        self._session_lock = threading.Lock()
         
     def set_ai_engine(self, ai_engine):
         self.ai_engine = ai_engine
         
     def _rotate_user_agent(self):
-        with self._session_lock:
-            self.ua_index = (self.ua_index + 1) % len(self.user_agents)
-            self.session.headers.update({'User-Agent': self.user_agents[self.ua_index]})
+        self.ua_index = (self.ua_index + 1) % len(self.user_agents)
+        self.session.headers.update({'User-Agent': self.user_agents[self.ua_index]})
     
     def _safe_scrape(self, url):
         try:
@@ -747,245 +483,12 @@ class EnhancedNewsScraper:
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'keep-alive',
-                'Cache-Control': 'no-cache'
             })
             if response.status_code == 200:
                 return response.text
-            else:
-                logger.warning(f"⚠️ Scrape failed with status {response.status_code}: {url}")
-        except requests.RequestException as e:
-            logger.warning(f"⚠️ Request error for {url}: {e}")
         except Exception as e:
-            logger.error(f"⚠️ Unexpected error scraping {url}: {e}")
+            pass
         return None
-    
-    def _clean_headline(self, text):
-        """Clean a headline by removing common noise"""
-        # Remove sentiment labels and emojis
-        for sent in ['Bullish', 'Bearish', 'Neutral', 'BULLISH', 'BEARISH', 'NEUTRAL', 
-                     '🟢', '🔴', '🟡', '📈', '📉', '⚡', '💰', '💎', '🚀']:
-            text = text.replace(sent, '').strip()
-        
-        # Remove ticker patterns like (AAPL)
-        text = re.sub(r'\([A-Z]{1,5}\)', '', text).strip()
-        
-        # Remove common prefixes/suffixes
-        text = re.sub(r'^[:\-\s•·●○◆◇▸▹►➢➤]+', '', text)
-        text = re.sub(r'[:\-\s•·●○◆◇▸▹►➢➤]+$', '', text)
-        
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        
-        return text.strip()
-
-    def _extract_sentiment(self, elem):
-        """Extract sentiment from element or its siblings"""
-        sentiment = 'NEUTRAL'
-        
-        # Check element's text
-        text = elem.get_text()
-        if 'Bullish' in text or '🟢' in text:
-            sentiment = 'BULLISH'
-        elif 'Bearish' in text or '🔴' in text:
-            sentiment = 'BEARISH'
-        elif 'Neutral' in text or '🟡' in text:
-            sentiment = 'NEUTRAL'
-        
-        # Check parent
-        if elem.parent:
-            parent_text = elem.parent.get_text()
-            if 'Bullish' in parent_text or '🟢' in parent_text:
-                sentiment = 'BULLISH'
-            elif 'Bearish' in parent_text or '🔴' in parent_text:
-                sentiment = 'BEARISH'
-            elif 'Neutral' in parent_text or '🟡' in parent_text:
-                sentiment = 'NEUTRAL'
-        
-        # Check siblings
-        if elem.next_sibling:
-            sibling_text = str(elem.next_sibling)
-            if 'Bullish' in sibling_text or '🟢' in sibling_text:
-                sentiment = 'BULLISH'
-            elif 'Bearish' in sibling_text or '🔴' in sibling_text:
-                sentiment = 'BEARISH'
-            elif 'Neutral' in sibling_text or '🟡' in sibling_text:
-                sentiment = 'NEUTRAL'
-        
-        return sentiment
-
-    def _extract_ticker(self, text):
-        """Extract ticker symbol from text"""
-        # Look for ticker in parentheses
-        ticker_match = re.search(r'\(([A-Z]{1,5})\)', text)
-        if ticker_match:
-            return ticker_match.group(1)
-        
-        # Look for ticker as a standalone word
-        ticker_match = re.search(r'\b([A-Z]{2,5})\b(?=\s|$|\.|\:)', text)
-        if ticker_match:
-            # Check if it's a common word not a ticker
-            common_words = {'US', 'UK', 'EU', 'AI', 'CEO', 'CFO', 'IPO', 'GDP', 'ETF', 'SEC', 'FDA'}
-            if ticker_match.group(1) not in common_words:
-                return ticker_match.group(1)
-        
-        return ''
-    
-    def scrape_feedflash(self, ticker=''):
-        """Scrape news from FeedFlash - Fixed to properly extract articles"""
-        results = {'news': []}
-        cache_key = f"feedflash_{ticker}"
-        if cache_key in self.scrape_cache:
-            cache_time, data = self.scrape_cache[cache_key]
-            if (datetime.now() - cache_time).seconds < self.cache_ttl:
-                return data
-        
-        try:
-            url = "https://feedflash-production.up.railway.app/news/"
-            html = self._safe_scrape(url)
-            if not html:
-                logger.warning("⚠️ Failed to fetch FeedFlash content")
-                return results
-            
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Remove ALL navigation, header, and control elements
-            for nav in soup.find_all(['nav', 'header', 'footer', 'aside']):
-                nav.decompose()
-            
-            # Remove elements with common navigation/control classes
-            for elem in soup.find_all(class_=re.compile(r'nav|menu|header|footer|control|toolbar|filter|tab|settings', re.I)):
-                elem.decompose()
-            
-            # Remove elements containing navigation text patterns
-            nav_patterns = [
-                r'FlashFeed.*Financial Intelligence',
-                r'News.*Screener.*Social',
-                r'Charts.*Momentum',
-                r'30s.*1m.*2m.*5m.*10m.*30m',
-                r'Auto',
-                r'Keywords Only',
-                r'News Feed.*articles'
-            ]
-            for pattern in nav_patterns:
-                for elem in soup.find_all(string=re.compile(pattern, re.DOTALL)):
-                    if elem.parent:
-                        elem.parent.decompose()
-            
-            # Also remove any elements with "Auto" or refresh controls
-            for elem in soup.find_all(string=re.compile(r'Auto|Refresh|30s|1m|2m|5m|10m|30m')):
-                if elem.parent and len(elem.parent.get_text(strip=True)) < 50:
-                    elem.parent.decompose()
-            
-            # Now look for actual news content
-            seen_headlines = set()
-            
-            # Look for elements that contain news content
-            potential_articles = []
-            
-            # Find all divs that might contain news
-            for div in soup.find_all('div'):
-                text = div.get_text(strip=True)
-                if len(text) < 25:
-                    continue
-                if any(pattern in text for pattern in ['FlashFeed', 'Financial Intelligence', 'News Feed', 'Keywords Only', 'Auto', '30s', '1m', '2m', '5m']):
-                    continue
-                if 25 < len(text) < 300:
-                    potential_articles.append((div, text))
-            
-            # Also check list items
-            for li in soup.find_all('li'):
-                text = li.get_text(strip=True)
-                if len(text) < 25:
-                    continue
-                if any(pattern in text for pattern in ['FlashFeed', 'Financial Intelligence', 'News Feed', 'Keywords Only', 'Auto', '30s', '1m', '2m', '5m']):
-                    continue
-                if 25 < len(text) < 300:
-                    potential_articles.append((li, text))
-            
-            # Process potential articles
-            for elem, text in potential_articles:
-                # Clean the headline
-                headline = self._clean_headline(text)
-                if not headline or len(headline) < 20:
-                    continue
-                
-                if headline in seen_headlines:
-                    continue
-                seen_headlines.add(headline)
-                
-                sentiment = self._extract_sentiment(elem)
-                ticker_symbol = self._extract_ticker(headline)
-                
-                if ticker and ticker_symbol:
-                    if ticker.upper() != ticker_symbol.upper():
-                        continue
-                
-                sentiment_data = {'label': sentiment, 'score': 0}
-                if self.ai_engine:
-                    sentiment_data = self.ai_engine.get_ai_sentiment(headline)
-                
-                news_item = {
-                    'headline': headline[:500],
-                    'source': 'FeedFlash',
-                    'time': '',
-                    'sentiment': sentiment_data,
-                    'link': '',
-                    'ticker': ticker_symbol
-                }
-                results['news'].append(news_item)
-                self.news_history.append(news_item)
-            
-            # If no articles found, try parsing the text directly
-            if not results['news']:
-                text = soup.get_text()
-                lines = [line.strip() for line in text.split('\n') if line.strip()]
-                
-                for line in lines:
-                    if any(pattern in line for pattern in ['FlashFeed', 'Financial Intelligence', 'News Feed', 'Keywords Only', 'Auto', '30s', '1m', '2m', '5m']):
-                        continue
-                    if len(line) < 25 or len(line) > 300:
-                        continue
-                    
-                    headline = self._clean_headline(line)
-                    if headline and len(headline) > 20 and headline not in seen_headlines:
-                        seen_headlines.add(headline)
-                        
-                        sentiment = 'NEUTRAL'
-                        if 'Bullish' in line or '🟢' in line:
-                            sentiment = 'BULLISH'
-                        elif 'Bearish' in line or '🔴' in line:
-                            sentiment = 'BEARISH'
-                        elif 'Neutral' in line or '🟡' in line:
-                            sentiment = 'NEUTRAL'
-                        
-                        ticker_symbol = self._extract_ticker(headline)
-                        
-                        if ticker and ticker_symbol:
-                            if ticker.upper() != ticker_symbol.upper():
-                                continue
-                        
-                        sentiment_data = {'label': sentiment, 'score': 0}
-                        if self.ai_engine:
-                            sentiment_data = self.ai_engine.get_ai_sentiment(headline)
-                        
-                        news_item = {
-                            'headline': headline[:500],
-                            'source': 'FeedFlash',
-                            'time': '',
-                            'sentiment': sentiment_data,
-                            'link': '',
-                            'ticker': ticker_symbol
-                        }
-                        results['news'].append(news_item)
-                        self.news_history.append(news_item)
-            
-            self.scrape_cache[cache_key] = (datetime.now(), results)
-            logger.info(f"✅ FeedFlash scraped {len(results['news'])} articles for {ticker or 'all'}")
-            
-        except Exception as e:
-            logger.error(f"❌ FeedFlash error for {ticker}: {e}")
-        
-        return results
     
     def scrape_finviz(self, ticker):
         results = {'news': []}
@@ -999,14 +502,14 @@ class EnhancedNewsScraper:
             html = self._safe_scrape(f"https://finviz.com/quote.ashx?t={ticker}")
             if html:
                 soup = BeautifulSoup(html, 'html.parser')
-                news_table = soup.find('table', {'id': 'news-table'}) or soup.find('table', {'class': 'fullview-news-outer'})
+                news_table = soup.find('table', {'class': 'fullview-news-outer'})
                 if news_table:
-                    for row in news_table.find_all('tr')[:8]:
+                    for row in news_table.find_all('tr')[:5]:
                         cells = row.find_all('td')
                         if len(cells) >= 2:
-                            headline = cells[1].get_text(strip=True)
+                            headline = cells[1].text.strip()
                             if headline and len(headline) > 5:
-                                time_text = cells[0].get_text(strip=True) if cells[0] else ''
+                                time_text = cells[0].text.strip() if cells[0] else ''
                                 news_item = {
                                     'headline': headline,
                                     'time': time_text,
@@ -1016,30 +519,97 @@ class EnhancedNewsScraper:
                                 results['news'].append(news_item)
                                 self.news_history.append(news_item)
             self.scrape_cache[cache_key] = (datetime.now(), results)
-        except Exception as e:
-            logger.error(f"Finviz error for {ticker}: {e}")
+        except:
+            pass
+        return results
+    
+    def scrape_marketwatch(self, ticker):
+        results = {'news': []}
+        try:
+            html = self._safe_scrape(f"https://www.marketwatch.com/investing/stock/{ticker}")
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('div', class_=re.compile('article__content|element--article'))[:3]:
+                    headline_elem = article.find('h3') or article.find('a')
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text and len(text) > 10:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'MarketWatch',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def scrape_tradingview(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://www.tradingview.com/symbols/{ticker}/"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for item in soup.find_all('div', class_=re.compile('news|article|item|tv-news-item'))[:3]:
+                    headline_elem = item.find('a') or item.find('h3') or item.find('div', class_=re.compile('title|headline'))
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text and len(text) > 10:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'TradingView',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
         return results
     
     def scrape_yahoo_finance(self, ticker):
         results = {'news': []}
         try:
             stock = yf.Ticker(ticker)
-            news = stock.news or []
-            for item in news[:8]:
-                content = item.get('content', item)
-                headline = content.get('title', '')
-                link = (content.get('canonicalUrl') or {}).get('url', '') or content.get('link', '')
-                if headline:
-                    news_item = {
-                        'headline': headline[:200],
-                        'source': 'Yahoo Finance',
-                        'link': link,
-                        'sentiment': self.ai_engine.get_ai_sentiment(headline) if self.ai_engine else {'label': 'NEUTRAL'}
-                    }
-                    results['news'].append(news_item)
-                    self.news_history.append(news_item)
-        except Exception as e:
-            logger.error(f"Yahoo Finance error for {ticker}: {e}")
+            news = stock.news
+            if news:
+                for item in news[:5]:
+                    headline = item.get('title', '')
+                    if headline:
+                        news_item = {
+                            'headline': headline[:200],
+                            'source': 'Yahoo Finance',
+                            'link': item.get('link', ''),
+                            'sentiment': self.ai_engine.get_ai_sentiment(headline) if self.ai_engine else {'label': 'NEUTRAL'}
+                        }
+                        results['news'].append(news_item)
+                        self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def scrape_seeking_alpha(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://seekingalpha.com/symbol/{ticker}/news"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('article', class_=re.compile('article|post'))[:3]:
+                    headline_elem = article.find('h3') or article.find('a')
+                    if headline_elem:
+                        text = headline_elem.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Seeking Alpha',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
         return results
     
     def scrape_google_news(self, ticker):
@@ -1047,25 +617,25 @@ class EnhancedNewsScraper:
         try:
             url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
             feed = feedparser.parse(url)
-            for entry in feed.entries[:8]:
+            for entry in feed.entries[:5]:
                 news_item = {
                     'headline': entry.title[:200],
                     'source': 'Google News',
                     'link': entry.link,
-                    'published': getattr(entry, 'published', ''),
+                    'published': entry.published if hasattr(entry, 'published') else '',
                     'sentiment': self.ai_engine.get_ai_sentiment(entry.title) if self.ai_engine else {'label': 'NEUTRAL'}
                 }
                 results['news'].append(news_item)
                 self.news_history.append(news_item)
-        except Exception as e:
-            logger.error(f"Google News error for {ticker}: {e}")
+        except:
+            pass
         return results
     
     def scrape_stocktwits(self, ticker):
         results = {'news': []}
         try:
             url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-            response = self.session.get(url, timeout=5)
+            response = self.session.get(url, timeout=3)
             if response.status_code == 200:
                 data = response.json()
                 for msg in data.get('messages', [])[:5]:
@@ -1076,34 +646,137 @@ class EnhancedNewsScraper:
                             'source': 'StockTwits',
                             'sentiment': self.ai_engine.get_ai_sentiment(body) if self.ai_engine else {'label': 'NEUTRAL'},
                             'user': msg.get('user', {}).get('username', ''),
+                            'created': msg.get('created_at', '')
                         }
                         results['news'].append(news_item)
                         self.news_history.append(news_item)
-        except Exception:
+        except:
             pass
         return results
     
-    def fetch_all_news(self, ticker, company_name=''):
+    def scrape_bloomberg(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://www.bloomberg.com/search?query={ticker}"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('article')[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Bloomberg',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def scrape_cnbc(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://www.cnbc.com/search/?query={ticker}"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('div', class_=re.compile('card|result|search-result'))[:3]:
+                    headline = article.find('a') or article.find('h3')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'CNBC',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def scrape_reuters(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://www.reuters.com/search/news?blob={ticker}"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('div', class_=re.compile('search-result|article'))[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Reuters',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def scrape_benzinga(self, ticker):
+        results = {'news': []}
+        try:
+            url = f"https://www.benzinga.com/search/?q={ticker}"
+            html = self._safe_scrape(url)
+            if html:
+                soup = BeautifulSoup(html, 'html.parser')
+                for article in soup.find_all('div', class_=re.compile('post|article|news-item'))[:3]:
+                    headline = article.find('h3') or article.find('a')
+                    if headline:
+                        text = headline.text.strip()
+                        if text:
+                            news_item = {
+                                'headline': text[:200],
+                                'source': 'Benzinga',
+                                'sentiment': self.ai_engine.get_ai_sentiment(text) if self.ai_engine else {'label': 'NEUTRAL'}
+                            }
+                            results['news'].append(news_item)
+                            self.news_history.append(news_item)
+        except:
+            pass
+        return results
+    
+    def fetch_all_news(self, ticker):
+        """Fetch news from ALL 11 sources with parallel processing"""
         all_news = {}
         
         sources = {
-            'feedflash': self.scrape_feedflash,
             'finviz': self.scrape_finviz,
+            'marketwatch': self.scrape_marketwatch,
+            'tradingview': self.scrape_tradingview,
             'yahoo': self.scrape_yahoo_finance,
+            'seekingalpha': self.scrape_seeking_alpha,
             'google_news': self.scrape_google_news,
             'stocktwits': self.scrape_stocktwits,
+            'bloomberg': self.scrape_bloomberg,
+            'cnbc': self.scrape_cnbc,
+            'reuters': self.scrape_reuters,
+            'benzinga': self.scrape_benzinga,
         }
         
-        with ThreadPoolExecutor(max_workers=len(sources)) as executor:
-            future_to_source = {executor.submit(fn, ticker): name for name, fn in sources.items()}
-            for future in as_completed(future_to_source, timeout=20):
+        with ThreadPoolExecutor(max_workers=11) as executor:
+            future_to_source = {
+                executor.submit(scraper_func, ticker): source_name 
+                for source_name, scraper_func in sources.items()
+            }
+            for future in as_completed(future_to_source):
                 source_name = future_to_source[future]
                 try:
-                    result = future.result(timeout=10)
+                    result = future.result(timeout=5)
                     if result and result.get('news'):
                         all_news[source_name] = result['news']
-                except Exception as e:
-                    logger.error(f"Error fetching from {source_name}: {e}")
+                except:
+                    pass
         
         return all_news
     
@@ -1117,8 +790,8 @@ class EnhancedNewsScraper:
 class AIAnalysisEngine:
     def __init__(self):
         self.analysis_cache = {}
-        self.cache_ttl = 180
-        self.ai_usage = {"openai": 0, "claude": 0, "groq": 0, "gemini": 0, "total": 0, "failures": 0}
+        self.cache_ttl = 120
+        self.ai_usage = {"openai": 0, "claude": 0, "groq": 0, "total": 0, "failures": 0}
         self.last_ai_source = None
         
     def get_ai_sentiment(self, text):
@@ -1141,94 +814,67 @@ class AIAnalysisEngine:
         except:
             return {'label': 'NEUTRAL', 'score': 0, 'confidence': 0}
     
-    def get_ai_analysis(self, ticker, company, yahoo_data, sentiment_score, news_data, prediction_data):
+    def get_ai_analysis(self, ticker, company, yahoo_data, sentiment_score, news_data):
         cache_key = f"{ticker}_{datetime.now().strftime('%Y-%m-%d-%H')}"
         if cache_key in self.analysis_cache:
             cache_time, data = self.analysis_cache[cache_key]
             if (datetime.now() - cache_time).seconds < self.cache_ttl:
                 return data
         
-        pred_info = "No prediction available"
-        if prediction_data:
-            pred_info = f"Predicted Price: ${prediction_data.get('predicted_price', 0)}, Expected Change: {prediction_data.get('expected_change', 0)}%, Confidence: {prediction_data.get('confidence', 0)}%"
-        
-        prompt = self._build_ai_prompt(ticker, company, yahoo_data, sentiment_score, news_data, pred_info)
+        prompt = self._build_ai_prompt(ticker, company, yahoo_data, sentiment_score, news_data)
         result = None
         ai_source = None
         
-        if not check_ai_rate_limit():
-            logger.warning(f"⚠️ Global AI rate limit reached, using fallback for {ticker}")
-            result = self._get_enhanced_fallback_analysis(ticker, company, yahoo_data, sentiment_score, prediction_data)
-            ai_source = "Technical Fallback (Rate Limited)"
-            self.last_ai_source = ai_source
-            self.ai_usage["total"] += 1
-        else:
-            if not is_openai_rate_limited() and openai_client:
-                try:
-                    result = self._get_openai_analysis(prompt)
-                    if result:
-                        ai_source = "OpenAI GPT"
-                        self.ai_usage["openai"] += 1
-                        self.ai_usage["total"] += 1
-                        self.last_ai_source = ai_source
-                except Exception as e:
-                    if "429" in str(e):
-                        mark_openai_rate_limited()
-                    logger.warning(f"OpenAI error: {e}")
-            
-            if not result and gemini_client:
-                try:
-                    result = self._get_gemini_analysis(prompt)
-                    if result:
-                        ai_source = "Gemini AI"
-                        self.ai_usage["gemini"] += 1
-                        self.ai_usage["total"] += 1
-                        self.last_ai_source = ai_source
-                except Exception as e:
-                    logger.warning(f"Gemini error: {e}")
-            
-            if not result and claude_client:
-                try:
-                    result = self._get_claude_analysis(prompt)
-                    if result:
-                        ai_source = "Claude AI"
-                        self.ai_usage["claude"] += 1
-                        self.ai_usage["total"] += 1
-                        self.last_ai_source = ai_source
-                except Exception as e:
-                    if "401" in str(e) or "Unauthorized" in str(e):
-                        logger.warning("⚠️ Claude API key invalid or unauthorized")
-                    else:
-                        logger.warning(f"Claude error: {e}")
-            
-            if not result and not is_groq_rate_limited() and groq_client:
-                try:
-                    result = self._get_groq_analysis(prompt)
-                    if result:
-                        ai_source = "Groq AI"
-                        self.ai_usage["groq"] += 1
-                        self.ai_usage["total"] += 1
-                        self.last_ai_source = ai_source
-                except Exception as e:
-                    if "429" in str(e):
-                        mark_groq_rate_limited()
-                    logger.warning(f"Groq error: {e}")
+        # 1. Try OpenAI
+        if not AI_DISABLED_GLOBALLY and openai_client:
+            try:
+                result = self._get_openai_analysis(prompt)
+                if result:
+                    ai_source = "OpenAI GPT"
+                    self.ai_usage["openai"] += 1
+                    self.ai_usage["total"] += 1
+                    self.last_ai_source = ai_source
+            except:
+                pass
         
+        # 2. Try Claude
+        if not result and claude_client:
+            try:
+                result = self._get_claude_analysis(prompt)
+                if result:
+                    ai_source = "Claude AI"
+                    self.ai_usage["claude"] += 1
+                    self.ai_usage["total"] += 1
+                    self.last_ai_source = ai_source
+            except:
+                pass
+        
+        # 3. Try Groq
+        if not result and not AI_DISABLED_GLOBALLY and not is_groq_rate_limited() and groq_client:
+            try:
+                result = self._get_groq_analysis(prompt)
+                if result:
+                    ai_source = "Groq AI"
+                    self.ai_usage["groq"] += 1
+                    self.ai_usage["total"] += 1
+                    self.last_ai_source = ai_source
+            except:
+                pass
+        
+        # 4. Enhanced Fallback
         if not result:
             self.ai_usage["failures"] += 1
-            result = self._get_enhanced_fallback_analysis(ticker, company, yahoo_data, sentiment_score, prediction_data)
+            result = self._get_enhanced_fallback_analysis(ticker, company, yahoo_data, sentiment_score)
             ai_source = "Technical Fallback"
             self.last_ai_source = ai_source
         
         if result:
             result['ai_source'] = ai_source
-            if prediction_data:
-                result['prediction'] = prediction_data
             self.analysis_cache[cache_key] = (datetime.now(), result)
             return result
         return None
     
-    def _build_ai_prompt(self, ticker, company, yahoo_data, sentiment_score, news_data, pred_info):
+    def _build_ai_prompt(self, ticker, company, yahoo_data, sentiment_score, news_data):
         headlines = []
         for source, items in news_data.items():
             if items:
@@ -1243,20 +889,11 @@ class AIAnalysisEngine:
         sentiment_direction = "POSITIVE" if sentiment_score > 0.3 else "NEGATIVE" if sentiment_score < -0.3 else "NEUTRAL"
         trend_strength = yahoo_data.get('trend_strength', 'NEUTRAL')
         
-        after_hours = yahoo_data.get('after_hours_pct', 0)
-        macd = yahoo_data.get('macd_bullish', False)
-        adx = yahoo_data.get('adx', 0)
-        breakout = yahoo_data.get('breakout', False)
-        relative_strength = yahoo_data.get('relative_strength', 0)
-        boll_signal = yahoo_data.get('boll_signal', 'NORMAL')
-        
         return f"""Analyze {ticker} ({company}) stock in detail and provide a comprehensive investment recommendation.
 
 CRITICAL PRICE DIRECTION: The stock is moving {price_direction} ({yahoo_data['change_1d']}% today)
 CRITICAL TREND STRENGTH: {trend_strength}
 CRITICAL SENTIMENT: News sentiment is {sentiment_direction} (score: {sentiment_score:.2f})
-AFTER HOURS: {after_hours:.2f}%
-PREDICTION: {pred_info}
 
 TECHNICAL DATA:
 - Current Price: ${yahoo_data['price']}
@@ -1271,16 +908,11 @@ TECHNICAL DATA:
 - Price vs SMA50: {yahoo_data.get('price_vs_sma50', 'N/A')}
 - Consecutive Down Days: {yahoo_data.get('consecutive_down_days', 0)}
 - P/E Ratio: {yahoo_data.get('pe_ratio', 'N/A')}
-- MACD Bullish: {macd}
-- ADX: {adx}
-- Bollinger Signal: {boll_signal}
-- Breakout: {breakout}
-- Relative Strength vs SPY: {relative_strength}%
 
 RECENT NEWS HEADLINES:
 {news_summary}
 
-Based on ALL factors including the prediction, provide a comprehensive recommendation.
+Based on ALL factors, provide a recommendation.
 Return ONLY valid JSON with this format:
 {{
     "rec": "STRONG BUY/BUY/WATCH/AVOID/SELL",
@@ -1301,21 +933,10 @@ Return ONLY valid JSON with this format:
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=400,
-                timeout=10
+                max_tokens=400
             )
             text = response.choices[0].message.content
             return self._parse_ai_response(text, "OpenAI")
-        except Exception as e:
-            if "429" in str(e):
-                mark_openai_rate_limited()
-            raise e
-    
-    def _get_gemini_analysis(self, prompt):
-        try:
-            response = gemini_client.generate_content(prompt)
-            text = response.text
-            return self._parse_ai_response(text, "Gemini")
         except:
             return None
     
@@ -1324,15 +945,12 @@ Return ONLY valid JSON with this format:
             response = claude_client.messages.create(
                 model="claude-3-sonnet-20240229",
                 max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=10
+                messages=[{"role": "user", "content": prompt}]
             )
             text = response.content[0].text
             return self._parse_ai_response(text, "Claude")
-        except Exception as e:
-            if "401" in str(e):
-                logger.warning("⚠️ Claude API key invalid")
-            raise e
+        except:
+            return None
     
     def _get_groq_analysis(self, prompt):
         try:
@@ -1340,15 +958,14 @@ Return ONLY valid JSON with this format:
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=400,
-                timeout=10
+                max_tokens=400
             )
             text = response.choices[0].message.content
             return self._parse_ai_response(text, "Groq")
         except Exception as e:
             if "429" in str(e):
                 mark_groq_rate_limited()
-            raise e
+            return None
     
     def _parse_ai_response(self, text, source):
         try:
@@ -1366,7 +983,8 @@ Return ONLY valid JSON with this format:
             pass
         return None
     
-    def _get_enhanced_fallback_analysis(self, ticker, company, yahoo_data, sentiment_score, prediction_data):
+    def _get_enhanced_fallback_analysis(self, ticker, company, yahoo_data, sentiment_score):
+        """ENHANCED fallback - More BUY recommendations for strong stocks"""
         score = 50
         change = yahoo_data['change_1d']
         rsi = yahoo_data['rsi']
@@ -1376,19 +994,12 @@ Return ONLY valid JSON with this format:
         price_vs_sma50 = yahoo_data.get('price_vs_sma50', 'BELOW')
         consecutive_down = yahoo_data.get('consecutive_down_days', 0)
         volume_ratio = yahoo_data.get('volume_ratio', 1)
-        after_hours = yahoo_data.get('after_hours_pct', 0)
-        macd_bullish = yahoo_data.get('macd_bullish', False)
-        adx = yahoo_data.get('adx', 0)
-        breakout = yahoo_data.get('breakout', False)
-        relative_strength = yahoo_data.get('relative_strength', 0)
-        boll_signal = yahoo_data.get('boll_signal', 'NORMAL')
         
-        pred_confidence = 0
-        pred_change = 0
-        if prediction_data:
-            pred_confidence = prediction_data.get('confidence', 0)
-            pred_change = prediction_data.get('expected_change', 0)
+        # ============================================================
+        # ENHANCED SCORING - More BUY opportunities
+        # ============================================================
         
+        # 1. PRICE DIRECTION - PRIMARY (weighted heavily)
         if change > 0:
             if change > 3:
                 score += 25
@@ -1404,24 +1015,7 @@ Return ONLY valid JSON with this format:
             else:
                 score -= 2
         
-        if pred_change > 2 and pred_confidence > 70:
-            score += 25
-        elif pred_change > 1 and pred_confidence > 60:
-            score += 18
-        elif pred_change > 0.5 and pred_confidence > 50:
-            score += 10
-        elif pred_change < -2 and pred_confidence > 70:
-            score -= 18
-        elif pred_change < -1 and pred_confidence > 60:
-            score -= 10
-        
-        if after_hours > 2:
-            score += 30
-        elif after_hours > 1:
-            score += 22
-        elif after_hours > 0.5:
-            score += 14
-        
+        # 2. CONSECUTIVE DOWN DAYS - MODERATE penalty
         if consecutive_down >= 5:
             score -= 15
         elif consecutive_down >= 3:
@@ -1431,6 +1025,7 @@ Return ONLY valid JSON with this format:
         else:
             score += 10
         
+        # 3. MOVING AVERAGES - Strong positive for being above
         if price_vs_sma20 == 'ABOVE' and price_vs_sma50 == 'ABOVE':
             score += 20
         elif price_vs_sma20 == 'ABOVE':
@@ -1440,6 +1035,7 @@ Return ONLY valid JSON with this format:
         elif price_vs_sma20 == 'BELOW':
             score -= 5
         
+        # 4. TREND STRENGTH - Big bonuses for uptrend
         if 'STRONG_BULLISH' in trend or trend_strength == 'STRONG_BULLISH':
             score += 22
         elif 'BULLISH' in trend or trend_strength == 'BULLISH':
@@ -1449,6 +1045,7 @@ Return ONLY valid JSON with this format:
         elif 'BEARISH' in trend or trend_strength == 'BEARISH':
             score -= 6
         
+        # 5. RSI - Optimal range is 40-70
         if 40 < rsi < 70:
             score += 10
         elif 30 < rsi < 40:
@@ -1464,6 +1061,7 @@ Return ONLY valid JSON with this format:
             else:
                 score += 10
         
+        # 6. VOLUME - Strong volume on up moves
         if volume_ratio > 1.5:
             if change > 0:
                 score += 18
@@ -1477,6 +1075,7 @@ Return ONLY valid JSON with this format:
             else:
                 score += 2
         
+        # 7. SENTIMENT - Positive sentiment boosts score
         if sentiment_score > 0.3:
             if change > 0:
                 score += 18
@@ -1488,35 +1087,10 @@ Return ONLY valid JSON with this format:
             else:
                 score -= 5
         
-        if macd_bullish:
-            score += 10
-        else:
-            score -= 5
-        
-        if adx > 30:
-            score += 12
-        elif adx > 25:
-            score += 8
-        elif adx < 15:
-            score -= 8
-        
-        if breakout:
-            score += 18
-        
-        if relative_strength > 5:
-            score += 12
-        elif relative_strength > 2:
-            score += 7
-        elif relative_strength < -3:
-            score -= 10
-        
-        if boll_signal == 'OVERSOLD':
-            score += 10
-        elif boll_signal == 'OVERBOUGHT':
-            score -= 8
-        
+        # 8. FINAL ADJUSTMENTS
         score = max(10, min(90, score))
         
+        # Determine recommendation based on balanced score
         if score >= 75:
             rec = "STRONG BUY"
             summary = f"📈 {ticker} strong upward momentum with positive trend"
@@ -1533,34 +1107,13 @@ Return ONLY valid JSON with this format:
             rec = "SELL"
             summary = f"🚨 {ticker} bearish signals, consider exit"
         
-        if after_hours > 1:
-            summary += f" (📈 AFTER HOURS +{after_hours:.1f}%)"
-        elif after_hours > 0.5:
-            summary += f" (📈 After Hours +{after_hours:.1f}%)"
-        
-        if pred_change > 1 and pred_confidence > 60:
-            summary += f" (📊 Prediction: +{pred_change:.1f}% with {pred_confidence:.0f}% confidence)"
-        
         if price_vs_sma20 == 'ABOVE':
-            summary += " (✅ Above SMA20)"
-        if consecutive_down < 2 and change > 0:
-            summary += " (📈 Positive momentum)"
-        if breakout:
-            summary += " (🚀 Breakout!)"
+            summary += " (Above SMA20 ✅)"
+        elif price_vs_sma20 == 'BELOW':
+            summary += " (Below SMA20 ⚠️)"
         
-        key_factors = ["Price direction", "Technical analysis", "Trend strength", "Sentiment correlation"]
-        if macd_bullish:
-            key_factors.append("MACD bullish")
-        if breakout:
-            key_factors.append("Breakout above resistance")
-        if relative_strength > 2:
-            key_factors.append("Outperforming market")
-        if adx > 25:
-            key_factors.append("Strong trend")
-        if after_hours > 1:
-            key_factors.append(f"After Hours +{after_hours:.1f}%")
-        if pred_change > 1 and pred_confidence > 60:
-            key_factors.append(f"AI Prediction +{pred_change:.1f}%")
+        if consecutive_down >= 3:
+            summary += f" ({consecutive_down} down days ⚠️)"
         
         return {
             "rec": rec,
@@ -1569,37 +1122,122 @@ Return ONLY valid JSON with this format:
             "technical_score": score,
             "sentiment_score": max(0, min(100, 50 + sentiment_score * 10)),
             "risk_level": "HIGH" if consecutive_down >= 4 or score < 30 else "MEDIUM" if score < 55 else "LOW",
-            "key_factors": key_factors[:5],
+            "key_factors": ["Price direction", "Technical analysis", "Trend strength", "Sentiment correlation"],
             "price_target": f"${yahoo_data['price'] * (1 + (score - 50)/250):.2f}",
-            "ai_insight": f"Price moving {change:+.1f}% with {consecutive_down} down days, AH: +{after_hours:.1f}%",
+            "ai_insight": f"Price moving {change:+.1f}% with {consecutive_down} down days, trend: {trend_strength}",
             "momentum_score": score,
             "_source": "Technical Fallback"
         }
+
+# ============================================================
+# INITIALIZE COMPONENTS
+# ============================================================
+
+ai_engine = AIAnalysisEngine()
+news_scraper = EnhancedNewsScraper()
+news_scraper.set_ai_engine(ai_engine)
+paper_trading = PaperTradingDB()
 
 # ============================================================
 # NEWS SOURCES CONFIG
 # ============================================================
 
 NEWS_SOURCES = {
-    "feedflash": {"name": "FeedFlash", "enabled": True, "icon": "⚡", "category": "aggregator"},
     "finviz": {"name": "Finviz", "enabled": True, "icon": "📊", "category": "equities"},
+    "marketwatch": {"name": "MarketWatch", "enabled": True, "icon": "📊", "category": "markets"},
+    "tradingview": {"name": "TradingView", "enabled": True, "icon": "📈", "category": "markets"},
     "yahoo": {"name": "Yahoo Finance", "enabled": True, "icon": "💹", "category": "markets"},
+    "seekingalpha": {"name": "Seeking Alpha", "enabled": True, "icon": "📰", "category": "equities"},
     "google_news": {"name": "Google News", "enabled": True, "icon": "🔍", "category": "aggregator"},
     "stocktwits": {"name": "StockTwits", "enabled": True, "icon": "💬", "category": "social"},
+    "bloomberg": {"name": "Bloomberg", "enabled": True, "icon": "📊", "category": "markets"},
+    "cnbc": {"name": "CNBC", "enabled": True, "icon": "📺", "category": "markets"},
+    "reuters": {"name": "Reuters", "enabled": True, "icon": "🌐", "category": "markets"},
+    "benzinga": {"name": "Benzinga", "enabled": True, "icon": "📈", "category": "equities"},
 }
 
 CATEGORIES = {
-    "aggregator": {"name": "Aggregators", "icon": "🔍", "count": 2},
-    "equities": {"name": "Equities", "icon": "📈", "count": 1},
-    "markets": {"name": "Markets", "icon": "📊", "count": 1},
+    "equities": {"name": "Equities", "icon": "📈", "count": 3},
+    "markets": {"name": "Markets", "icon": "📊", "count": 5},
     "social": {"name": "Social", "icon": "💬", "count": 1},
+    "aggregator": {"name": "Aggregators", "icon": "🔍", "count": 2},
 }
 
 # ============================================================
-# STOCKS DATABASE
+# STOCKS DATABASE - COMPLETE WITH MPC INCLUDED
 # ============================================================
 
 ALL_STOCKS = {
+    # ===== IMAGE 1: STOCKS 1-20 =====
+    "VRAX": {"name": "Virax Biolabs Group Ltd", "sector": "Healthcare"},
+    "TDTH": {"name": "Trident Digital Tech Holdings Ltd ADR", "sector": "Technology"},
+    "RPGL": {"name": "Republic Power Group Ltd", "sector": "Energy"},
+    "SDOT": {"name": "Sadot Group Inc", "sector": "Technology"},
+    "SUNE": {"name": "SUNation Energy Inc", "sector": "Energy"},
+    "EVGN": {"name": "Evogene Ltd", "sector": "Healthcare"},
+    "RBNE": {"name": "Robin Energy Ltd", "sector": "Energy"},
+    "NDRA": {"name": "ENDRA Life Sciences Inc", "sector": "Healthcare"},
+    "LGHL": {"name": "Lion Group Holding Ltd ADR", "sector": "Financial"},
+    "RKTO": {"name": "Rocket One Inc", "sector": "Technology"},
+    "MGIH": {"name": "Millennium Group International Holdings Ltd", "sector": "Financial"},
+    "FEED": {"name": "ENvue Medical Inc", "sector": "Healthcare"},
+    "HCTI": {"name": "Healthcare Triangle Inc", "sector": "Healthcare"},
+    "NAMI": {"name": "Jinxin Technology Holding Co ADR", "sector": "Technology"},
+    "OMH": {"name": "Ohmyhome Ltd", "sector": "Consumer"},
+    "SDST": {"name": "Stardust Power Inc", "sector": "Energy"},
+    "FGNX": {"name": "FG Nexus Inc", "sector": "Technology"},
+    "BJDX": {"name": "Bluejay Diagnostics Inc", "sector": "Healthcare"},
+    "BTAI": {"name": "BioXcel Therapeutics Inc", "sector": "Healthcare"},
+    "GREE": {"name": "Greenidge Generation Holdings Inc", "sector": "Technology"},
+    
+    # ===== IMAGE 2: STOCKS 21-40 =====
+    "SHFS": {"name": "SHF Holdings Inc", "sector": "Financial"},
+    "PMA": {"name": "Ming Shing Group Holdings Ltd", "sector": "Financial"},
+    "NWTG": {"name": "Newton Golf Co Inc", "sector": "Consumer"},
+    "XHLD": {"name": "TEN Holdings Inc", "sector": "Technology"},
+    "ZNB": {"name": "Zeta Network Group", "sector": "Technology"},
+    "ZBAO": {"name": "Zhibao Technology Inc", "sector": "Technology"},
+    "PHGE": {"name": "BiomX Inc", "sector": "Healthcare"},
+    "PRPO": {"name": "Precipio Inc", "sector": "Healthcare"},
+    "BRAG": {"name": "Bragg Gaming Group Inc", "sector": "Consumer"},
+    "SCNX": {"name": "Scienture Holdings Inc", "sector": "Healthcare"},
+    "GTIM": {"name": "Good Times Restaurants Inc", "sector": "Consumer"},
+    "EDBL": {"name": "Edible Garden AG Inc", "sector": "Consumer"},
+    "REFR": {"name": "Research Frontiers Inc", "sector": "Technology"},
+    "EDUC": {"name": "Educational Development Corp", "sector": "Consumer"},
+    "NAAS": {"name": "Naas Technology Inc ADR", "sector": "Technology"},
+    "GMEX": {"name": "GMEX Robotics Corp", "sector": "Industrial"},
+    "EVTV": {"name": "Envirotech Vehicles Inc", "sector": "Industrial"},
+    "AIRI": {"name": "Air Industries Group", "sector": "Industrial"},
+    "CNTY": {"name": "Century Casinos Inc", "sector": "Consumer"},
+    "NCEL": {"name": "NewcelX Ltd", "sector": "Healthcare"},
+    
+    # ===== IMAGE 3: STOCKS 41-60 =====
+    "ELOX": {"name": "Eloxx Pharmaceuticals Inc", "sector": "Healthcare"},
+    "VMAR": {"name": "Vision Marine Technologies Inc", "sector": "Industrial"},
+    "MVO": {"name": "MV Oil Trust", "sector": "Energy"},
+    "NCNA": {"name": "NuCana plc ADR", "sector": "Healthcare"},
+    "ALAR": {"name": "Alarum Technologies Ltd ADR", "sector": "Technology"},
+    "FMST": {"name": "Foremost Clean Energy Ltd", "sector": "Energy"},
+    "CMMB": {"name": "Chemomab Therapeutics Ltd ADR", "sector": "Healthcare"},
+    "ACTU": {"name": "Actuate Therapeutics Inc", "sector": "Healthcare"},
+    "GROV": {"name": "Grove Collaborative Holdings Inc", "sector": "Consumer"},
+    "IBG": {"name": "Innovation Beverage Group Ltd", "sector": "Consumer"},
+    "ELPW": {"name": "Elong Power Holding Ltd", "sector": "Technology"},
+    "APVO": {"name": "Aptevo Therapeutics Inc", "sector": "Healthcare"},
+    "ZSTK": {"name": "ZeroStack Corp", "sector": "Technology"},
+    "TRNR": {"name": "Interactive Strength Inc", "sector": "Consumer"},
+    "CCHH": {"name": "CCH Holdings Ltd", "sector": "Financial"},
+    "YHC": {"name": "LQR House Inc", "sector": "Consumer"},
+    "CYAB": {"name": "Cybara Inc", "sector": "Technology"},
+    "TVRD": {"name": "Tvardi Therapeutics Inc", "sector": "Healthcare"},
+    "ABVC": {"name": "ABVC BioPharma Inc", "sector": "Healthcare"},
+    "AEON": {"name": "AEON Biopharma Inc", "sector": "Healthcare"},
+    
+    # ===== ADDITIONAL STOCKS =====
+    "AFJK": {"name": "Aimei Health Technology Co Ltd", "sector": "Financial"},
+    
+    # ===== MAJOR STOCKS =====
     "AAPL": {"name": "Apple Inc.", "sector": "Technology"},
     "MSFT": {"name": "Microsoft Corp", "sector": "Technology"},
     "GOOGL": {"name": "Alphabet Inc", "sector": "Technology"},
@@ -1622,6 +1260,14 @@ ALL_STOCKS = {
     "SNOW": {"name": "Snowflake Inc", "sector": "Technology"},
     "PLTR": {"name": "Palantir Technologies", "sector": "Technology"},
     "UBER": {"name": "Uber Technologies", "sector": "Technology"},
+    "DDOG": {"name": "Datadog Inc", "sector": "Technology"},
+    "MDB": {"name": "MongoDB Inc", "sector": "Technology"},
+    "ZS": {"name": "Zscaler Inc", "sector": "Technology"},
+    "PANW": {"name": "Palo Alto Networks", "sector": "Technology"},
+    "CRWD": {"name": "CrowdStrike Holdings", "sector": "Technology"},
+    "FTNT": {"name": "Fortinet Inc", "sector": "Technology"},
+    
+    # Financial
     "JPM": {"name": "JPMorgan Chase", "sector": "Financial"},
     "BAC": {"name": "Bank of America", "sector": "Financial"},
     "WFC": {"name": "Wells Fargo", "sector": "Financial"},
@@ -1632,6 +1278,14 @@ ALL_STOCKS = {
     "MA": {"name": "Mastercard Inc", "sector": "Financial"},
     "PYPL": {"name": "PayPal Holdings", "sector": "Financial"},
     "AXP": {"name": "American Express", "sector": "Financial"},
+    "SCHW": {"name": "Charles Schwab", "sector": "Financial"},
+    "PNC": {"name": "PNC Financial", "sector": "Financial"},
+    "USB": {"name": "US Bancorp", "sector": "Financial"},
+    "BK": {"name": "Bank of New York Mellon", "sector": "Financial"},
+    "TROW": {"name": "T. Rowe Price", "sector": "Financial"},
+    "STT": {"name": "State Street Corp", "sector": "Financial"},
+    
+    # Healthcare
     "JNJ": {"name": "Johnson & Johnson", "sector": "Healthcare"},
     "UNH": {"name": "UnitedHealth", "sector": "Healthcare"},
     "PFE": {"name": "Pfizer Inc", "sector": "Healthcare"},
@@ -1644,6 +1298,12 @@ ALL_STOCKS = {
     "GILD": {"name": "Gilead Sciences", "sector": "Healthcare"},
     "AMGN": {"name": "Amgen Inc", "sector": "Healthcare"},
     "CVS": {"name": "CVS Health Corp", "sector": "Healthcare"},
+    "HCA": {"name": "HCA Healthcare", "sector": "Healthcare"},
+    "BDX": {"name": "Becton Dickinson", "sector": "Healthcare"},
+    "ZTS": {"name": "Zoetis Inc", "sector": "Healthcare"},
+    "REGN": {"name": "Regeneron Pharma", "sector": "Healthcare"},
+    
+    # Consumer
     "KO": {"name": "Coca-Cola Co", "sector": "Consumer"},
     "PEP": {"name": "PepsiCo Inc", "sector": "Consumer"},
     "COST": {"name": "Costco Wholesale", "sector": "Consumer"},
@@ -1656,6 +1316,13 @@ ALL_STOCKS = {
     "NKE": {"name": "Nike Inc", "sector": "Consumer"},
     "DIS": {"name": "Walt Disney", "sector": "Consumer"},
     "PG": {"name": "Procter & Gamble", "sector": "Consumer"},
+    "CL": {"name": "Colgate-Palmolive", "sector": "Consumer"},
+    "KMB": {"name": "Kimberly-Clark", "sector": "Consumer"},
+    "EL": {"name": "Estee Lauder", "sector": "Consumer"},
+    "MCO": {"name": "Moody's Corp", "sector": "Consumer"},
+    
+    # Energy - INCLUDING MPC (Marathon Petroleum)
+    "MPC": {"name": "Marathon Petroleum Corp", "sector": "Energy"},
     "XOM": {"name": "Exxon Mobil", "sector": "Energy"},
     "CVX": {"name": "Chevron Corp", "sector": "Energy"},
     "COP": {"name": "ConocoPhillips", "sector": "Energy"},
@@ -1664,6 +1331,11 @@ ALL_STOCKS = {
     "OXY": {"name": "Occidental Petroleum", "sector": "Energy"},
     "PSX": {"name": "Phillips 66", "sector": "Energy"},
     "VLO": {"name": "Valero Energy", "sector": "Energy"},
+    "KMI": {"name": "Kinder Morgan", "sector": "Energy"},
+    "WMB": {"name": "Williams Companies", "sector": "Energy"},
+    "OKE": {"name": "ONEOK Inc", "sector": "Energy"},
+    
+    # Industrial
     "GE": {"name": "General Electric", "sector": "Industrial"},
     "CAT": {"name": "Caterpillar Inc", "sector": "Industrial"},
     "BA": {"name": "Boeing Co", "sector": "Industrial"},
@@ -1673,11 +1345,21 @@ ALL_STOCKS = {
     "LMT": {"name": "Lockheed Martin", "sector": "Industrial"},
     "NOC": {"name": "Northrop Grumman", "sector": "Industrial"},
     "GD": {"name": "General Dynamics", "sector": "Industrial"},
+    "EMR": {"name": "Emerson Electric", "sector": "Industrial"},
     "MMM": {"name": "3M Company", "sector": "Industrial"},
+    "DOW": {"name": "Dow Inc", "sector": "Industrial"},
+    
+    # Communications
     "T": {"name": "AT&T Inc", "sector": "Communications"},
     "VZ": {"name": "Verizon Communications", "sector": "Communications"},
     "TMUS": {"name": "T-Mobile US", "sector": "Communications"},
     "CMCSA": {"name": "Comcast Corp", "sector": "Communications"},
+    "CHTR": {"name": "Charter Communications", "sector": "Communications"},
+    "EBAY": {"name": "eBay Inc", "sector": "Communications"},
+    "SNAP": {"name": "Snap Inc", "sector": "Communications"},
+    "TWLO": {"name": "Twilio Inc", "sector": "Communications"},
+    
+    # Real Estate
     "AMT": {"name": "American Tower", "sector": "Real Estate"},
     "PLD": {"name": "Prologis Inc", "sector": "Real Estate"},
     "SPG": {"name": "Simon Property Group", "sector": "Real Estate"},
@@ -1689,16 +1371,15 @@ ALL_STOCKS = {
 }
 
 # ============================================================
-# ENHANCED STOCK ANALYZER - FIXED PRICING
+# ENHANCED STOCK ANALYZER
 # ============================================================
 
 class EnhancedStockAnalyzer:
     def __init__(self):
         self.stock_cache = {}
         self.cache_ttl = 60
-        self.ai_engine = None
-        self.news_scraper = None
-        self.prediction_engine = None
+        self.ai_engine = ai_engine
+        self.news_scraper = news_scraper
         self.loaded_tickers = set()
         self.filters = {
             'min_price': 0,
@@ -1712,15 +1393,6 @@ class EnhancedStockAnalyzer:
             'trend_filter': 'all'
         }
     
-    def set_ai_engine(self, ai_engine):
-        self.ai_engine = ai_engine
-    
-    def set_news_scraper(self, news_scraper):
-        self.news_scraper = news_scraper
-    
-    def set_prediction_engine(self, prediction_engine):
-        self.prediction_engine = prediction_engine
-    
     def set_filters(self, filters):
         self.filters.update(filters)
     
@@ -1733,6 +1405,8 @@ class EnhancedStockAnalyzer:
         rsi = stock_data.get('rsi', 50)
         change = stock_data.get('change_1d', 0)
         sentiment = stock_data.get('sentiment_aggregate', 0)
+        momentum = stock_data.get('momentum_score', 50)
+        confidence = stock_data.get('confidence', 50)
         trend = stock_data.get('trend', 'NEUTRAL')
         
         if price < self.filters.get('min_price', 0) or price > self.filters.get('max_price', 10000):
@@ -1758,142 +1432,6 @@ class EnhancedStockAnalyzer:
         
         return True
     
-    def _create_data_from_av(self, ticker, av_data):
-        """Create stock data from Alpha Vantage response - REAL PRICES"""
-        sector_info = ALL_STOCKS.get(ticker, {})
-        price = av_data.get('price', 0)
-        
-        # If price is 0 or invalid, use fallback
-        if price <= 0:
-            return self._get_fallback_data(ticker)
-        
-        # Try to get historical for better data
-        hist_data = get_alpha_vantage_historical(ticker, 60)
-        if hist_data and hist_data.get('prices'):
-            prices = hist_data['prices']
-            if len(prices) >= 2:
-                change_1d = ((prices[-1] - prices[-2]) / prices[-2]) * 100
-                # Calculate RSI if we have enough data
-                rsi = 50  # Default
-                if len(prices) >= 14:
-                    gains = []
-                    losses = []
-                    for i in range(1, len(prices)):
-                        diff = prices[i] - prices[i-1]
-                        if diff > 0:
-                            gains.append(diff)
-                            losses.append(0)
-                        else:
-                            gains.append(0)
-                            losses.append(abs(diff))
-                    avg_gain = sum(gains[-14:]) / 14
-                    avg_loss = sum(losses[-14:]) / 14
-                    if avg_loss > 0:
-                        rs = avg_gain / avg_loss
-                        rsi = 100 - (100 / (1 + rs))
-                
-                # Calculate SMA
-                sma20 = sum(prices[-20:]) / 20 if len(prices) >= 20 else price
-                sma50 = sum(prices[-50:]) / 50 if len(prices) >= 50 else price
-                
-                # Determine trend
-                if price > sma20 and sma20 > sma50:
-                    trend = "STRONG BULLISH"
-                    trend_strength = "STRONG_BULLISH"
-                elif price > sma20 and price > sma50:
-                    trend = "BULLISH"
-                    trend_strength = "BULLISH"
-                elif price > sma20 and price < sma50:
-                    trend = "CONSOLIDATING (above SMA20)"
-                    trend_strength = "NEUTRAL_BULLISH"
-                elif price < sma20 and sma20 < sma50:
-                    trend = "STRONG BEARISH"
-                    trend_strength = "STRONG_BEARISH"
-                elif price < sma20 and price < sma50:
-                    trend = "BEARISH"
-                    trend_strength = "BEARISH"
-                elif price < sma20 and price > sma50:
-                    trend = "CONSOLIDATING (below SMA20)"
-                    trend_strength = "NEUTRAL_BEARISH"
-                else:
-                    trend = "NEUTRAL"
-                    trend_strength = "NEUTRAL"
-                
-                # Count consecutive down days
-                consecutive_down = 0
-                for i in range(len(prices)-1, 0, -1):
-                    if prices[i] < prices[i-1]:
-                        consecutive_down += 1
-                    else:
-                        break
-                
-                return {
-                    "ticker": ticker,
-                    "company": sector_info.get('name', ticker),
-                    "sector": sector_info.get('sector', 'Unknown'),
-                    "price": round(price, 2),
-                    "change_1d": round(change_1d, 2),
-                    "rsi": round(rsi, 1),
-                    "volume_ratio": 1.0,
-                    "trend": trend,
-                    "trend_strength": trend_strength,
-                    "trend_icon": "📈" if "BULLISH" in trend or "UPTREND" in trend else "📉" if "BEARISH" in trend or "DOWNTREND" in trend else "➡️",
-                    "sma20": round(sma20, 2),
-                    "sma50": round(sma50, 2),
-                    "price_vs_sma20": "ABOVE" if price > sma20 else "BELOW",
-                    "price_vs_sma50": "ABOVE" if price > sma50 else "BELOW",
-                    "consecutive_down_days": consecutive_down,
-                    "historical": {
-                        "dates": hist_data.get('dates', [])[-30:],
-                        "prices": prices[-30:],
-                        "volumes": hist_data.get('volumes', [])[-30:]
-                    },
-                    "pe_ratio": None,
-                    "target_price": None,
-                    "current_volume": av_data.get('volume', 0),
-                    "after_hours_price": price,
-                    "after_hours_pct": 0,
-                    "macd_bullish": change_1d > 0,
-                    "adx": 20,
-                    "breakout": change_1d > 1.5,
-                    "relative_strength": change_1d,
-                    "boll_signal": "NORMAL",
-                    "support": round(price * 0.95, 2),
-                    "resistance": round(price * 1.05, 2),
-                }
-        
-        # Fallback with real price
-        return {
-            "ticker": ticker,
-            "company": sector_info.get('name', ticker),
-            "sector": sector_info.get('sector', 'Unknown'),
-            "price": round(price, 2),
-            "change_1d": round(av_data.get('change', 0), 2),
-            "rsi": 50,
-            "volume_ratio": 1.0,
-            "trend": "BULLISH" if av_data.get('change', 0) > 0 else "BEARISH",
-            "trend_strength": "NEUTRAL",
-            "trend_icon": "📈" if av_data.get('change', 0) > 0 else "📉",
-            "sma20": round(price * 0.98, 2),
-            "sma50": round(price * 0.97, 2),
-            "price_vs_sma20": "ABOVE" if av_data.get('change', 0) > 0 else "BELOW",
-            "price_vs_sma50": "ABOVE" if av_data.get('change', 0) > -0.5 else "BELOW",
-            "consecutive_down_days": 0 if av_data.get('change', 0) > 0 else 1,
-            "historical": {"dates": [], "prices": [], "volumes": []},
-            "pe_ratio": None,
-            "target_price": None,
-            "current_volume": av_data.get('volume', 0),
-            "after_hours_price": price,
-            "after_hours_pct": 0,
-            "macd_bullish": av_data.get('change', 0) > 0,
-            "adx": 20,
-            "breakout": False,
-            "relative_strength": av_data.get('change', 0),
-            "boll_signal": "NORMAL",
-            "support": round(price * 0.95, 2),
-            "resistance": round(price * 1.05, 2),
-        }
-    
     def get_stock_data(self, ticker):
         if ticker in self.stock_cache:
             cache_time, data = self.stock_cache[ticker]
@@ -1902,63 +1440,31 @@ class EnhancedStockAnalyzer:
         
         try:
             stock = yf.Ticker(ticker)
-            hist = stock.history(period="2mo", timeout=5)  # Increased timeout
-            
-            # CRITICAL FIX: Check if we got real data
-            if hist.empty or len(hist) < 2:
-                logger.warning(f"⚠️ No historical data for {ticker}, trying Alpha Vantage...")
-                # Try Alpha Vantage as backup
-                av_data = get_alpha_vantage_price(ticker)
-                if av_data and av_data.get('price', 0) > 0:
-                    logger.info(f"✅ Got price for {ticker} from Alpha Vantage: ${av_data['price']}")
-                    result = self._create_data_from_av(ticker, av_data)
-                    self.stock_cache[ticker] = (datetime.now(), result)
-                    return result
-                return self._get_fallback_data(ticker)
+            hist = stock.history(period="2mo", timeout=2)
+            if hist.empty:
+                return None
             
             info = stock.info
+            current_price = hist['Close'].iloc[-1]
+            current_volume = hist['Volume'].iloc[-1]
             
-            # CRITICAL FIX: Use the most recent price from Yahoo
-            current_price = float(hist['Close'].iloc[-1])
-            
-            # Validate the price is reasonable (not a fallback value)
-            if current_price <= 0 or current_price > 1000000:
-                logger.warning(f"⚠️ Invalid price for {ticker}: {current_price}, trying Alpha Vantage...")
-                av_data = get_alpha_vantage_price(ticker)
-                if av_data and av_data.get('price', 0) > 0:
-                    result = self._create_data_from_av(ticker, av_data)
-                    self.stock_cache[ticker] = (datetime.now(), result)
-                    return result
-                return self._get_fallback_data(ticker)
-            
-            # Get real historical data
-            current_volume = float(hist['Volume'].iloc[-1])
-            
-            # Calculate RSI
             delta = hist['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             loss = loss.replace(0, 0.001)
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
-            current_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
+            current_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
             
-            # Calculate SMAs
-            sma20_val = hist['Close'].rolling(20).mean()
-            sma50_val = hist['Close'].rolling(50).mean()
-            sma20 = float(sma20_val.iloc[-1]) if len(hist) >= 20 and not pd.isna(sma20_val.iloc[-1]) else float(current_price)
-            sma50 = float(sma50_val.iloc[-1]) if len(hist) >= 50 and not pd.isna(sma50_val.iloc[-1]) else float(current_price)
+            sma20 = hist['Close'].rolling(20).mean().iloc[-1] if len(hist) >= 20 else current_price
+            sma50 = hist['Close'].rolling(50).mean().iloc[-1] if len(hist) >= 50 else current_price
             
-            # Calculate average volume
-            avg_volume_val = hist['Volume'].rolling(20).mean()
-            avg_volume = float(avg_volume_val.iloc[-1]) if len(hist) >= 20 and not pd.isna(avg_volume_val.iloc[-1]) else float(hist['Volume'].mean())
-            volume_ratio = float(current_volume / avg_volume) if avg_volume > 0 else 1
+            avg_volume = hist['Volume'].rolling(20).mean().iloc[-1] if len(hist) >= 20 else hist['Volume'].mean()
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
             
-            # Price vs SMAs
             price_vs_sma20 = 'ABOVE' if current_price > sma20 else 'BELOW'
             price_vs_sma50 = 'ABOVE' if current_price > sma50 else 'BELOW'
             
-            # Consecutive down days
             consecutive_down = 0
             close_prices = hist['Close'].tolist()
             for i in range(len(close_prices)-1, 0, -1):
@@ -1967,8 +1473,7 @@ class EnhancedStockAnalyzer:
                 else:
                     break
             
-            # Determine trend
-            if current_price > sma20 and sma20 > sma50:
+            if current_price > sma20 > sma50:
                 trend = "STRONG BULLISH"
                 trend_strength = "STRONG_BULLISH"
             elif current_price > sma20 and current_price > sma50:
@@ -1977,7 +1482,7 @@ class EnhancedStockAnalyzer:
             elif current_price > sma20 and current_price < sma50:
                 trend = "CONSOLIDATING (above SMA20)"
                 trend_strength = "NEUTRAL_BULLISH"
-            elif current_price < sma20 and sma20 < sma50:
+            elif current_price < sma20 < sma50:
                 trend = "STRONG BEARISH"
                 trend_strength = "STRONG_BEARISH"
             elif current_price < sma20 and current_price < sma50:
@@ -1990,90 +1495,7 @@ class EnhancedStockAnalyzer:
                 trend = "NEUTRAL"
                 trend_strength = "NEUTRAL"
             
-            # Calculate 1-day change
-            change_1d = float(((current_price - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100) if len(hist) >= 2 else 0
-            
-            # After hours data
-            after_hours_price = float(info.get('postMarketPrice', 0)) if info.get('postMarketPrice') else 0
-            after_hours_pct = 0
-            if after_hours_price > 0 and current_price > 0:
-                after_hours_pct = float(((after_hours_price - current_price) / current_price) * 100)
-            
-            # MACD
-            macd_bullish = False
-            try:
-                if len(hist) >= 26:
-                    ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
-                    ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
-                    macd_line = ema12 - ema26
-                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                    if len(macd_line) > 0 and len(signal_line) > 0:
-                        macd_val = float(macd_line.iloc[-1])
-                        signal_val = float(signal_line.iloc[-1])
-                        macd_bullish = macd_val > signal_val
-            except:
-                pass
-            
-            # ADX
-            adx = 0
-            try:
-                if len(hist) >= 28:
-                    plus_dm = hist['High'].diff()
-                    minus_dm = hist['Low'].diff() * -1
-                    tr1 = hist['High'] - hist['Low']
-                    tr2 = abs(hist['High'] - hist['Close'].shift())
-                    tr3 = abs(hist['Low'] - hist['Close'].shift())
-                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                    atr = tr.rolling(14).mean()
-                    plus_di = 100 * ((plus_dm.where(plus_dm > minus_dm, 0)).rolling(14).mean() / atr)
-                    minus_di = 100 * ((minus_dm.where(minus_dm > plus_dm, 0)).rolling(14).mean() / atr)
-                    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
-                    adx_series = dx.rolling(14).mean()
-                    if len(adx_series) > 0 and not pd.isna(adx_series.iloc[-1]):
-                        adx = float(adx_series.iloc[-1])
-            except:
-                pass
-            
-            # Breakout detection
-            breakout = False
-            try:
-                if len(hist) >= 20:
-                    highest20 = hist['High'].rolling(20).max()
-                    if len(highest20) >= 2 and not pd.isna(highest20.iloc[-2]):
-                        highest20_val = float(highest20.iloc[-2])
-                        breakout = current_price > highest20_val
-            except:
-                pass
-            
-            # Relative strength vs SPY
-            relative_strength = 0
-            try:
-                if len(hist) >= 20:
-                    spy = get_spy_data()
-                    if spy is not None and not spy.empty and len(spy) >= 20:
-                        stock_return = float((hist['Close'].iloc[-1] / hist['Close'].iloc[-20]) - 1)
-                        spy_return = float((spy['Close'].iloc[-1] / spy['Close'].iloc[-20]) - 1)
-                        relative_strength = float((stock_return - spy_return) * 100)
-            except:
-                pass
-            
-            # Bollinger Bands
-            boll_signal = "NORMAL"
-            try:
-                if len(hist) >= 20:
-                    middle = hist['Close'].rolling(20).mean()
-                    std = hist['Close'].rolling(20).std()
-                    upper = middle + std * 2
-                    lower = middle - std * 2
-                    if len(upper) > 0 and not pd.isna(upper.iloc[-1]):
-                        upper_val = float(upper.iloc[-1])
-                        lower_val = float(lower.iloc[-1])
-                        if current_price < lower_val:
-                            boll_signal = "OVERSOLD"
-                        elif current_price > upper_val:
-                            boll_signal = "OVERBOUGHT"
-            except:
-                pass
+            change_1d = ((current_price - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100 if len(hist) >= 2 else 0
             
             sector_info = ALL_STOCKS.get(ticker, {})
             result = {
@@ -2099,115 +1521,15 @@ class EnhancedStockAnalyzer:
                 },
                 "pe_ratio": round(float(info.get('trailingPE', 0)), 2) if info.get('trailingPE') else None,
                 "target_price": round(float(info.get('targetMeanPrice', 0)), 2) if info.get('targetMeanPrice') else None,
-                "current_volume": int(current_volume),
-                "after_hours_price": round(float(after_hours_price), 2),
-                "after_hours_pct": round(float(after_hours_pct), 2),
-                "macd_bullish": macd_bullish,
-                "adx": round(float(adx), 1),
-                "breakout": breakout,
-                "relative_strength": round(float(relative_strength), 2),
-                "boll_signal": boll_signal,
-                "support": round(float(current_price * 0.95), 2),
-                "resistance": round(float(current_price * 1.05), 2),
+                "current_volume": int(current_volume)
             }
             self.stock_cache[ticker] = (datetime.now(), result)
-            logger.info(f"✅ Got real price for {ticker}: ${result['price']}")
             return result
         except Exception as e:
-            logger.error(f"⚠️ Error for {ticker}: {e}")
-            # Try Alpha Vantage as backup
-            av_data = get_alpha_vantage_price(ticker)
-            if av_data and av_data.get('price', 0) > 0:
-                logger.info(f"✅ Got price for {ticker} from Alpha Vantage (fallback): ${av_data['price']}")
-                result = self._create_data_from_av(ticker, av_data)
-                self.stock_cache[ticker] = (datetime.now(), result)
-                return result
-            return self._get_fallback_data(ticker)
-    
-    def _get_fallback_data(self, ticker):
-        """ONLY used as absolute last resort - uses real price from Alpha Vantage if possible"""
-        # Try one more time to get real price from Alpha Vantage
-        av_data = get_alpha_vantage_price(ticker)
-        if av_data and av_data.get('price', 0) > 0:
-            return self._create_data_from_av(ticker, av_data)
-        
-        # If all else fails, use a reasonable default based on sector
-        sector_info = ALL_STOCKS.get(ticker, {})
-        sector = sector_info.get('sector', 'Unknown')
-        
-        # Use more realistic default prices based on sector
-        sector_prices = {
-            'Technology': 150 + random.random() * 100,
-            'Financial': 50 + random.random() * 80,
-            'Healthcare': 80 + random.random() * 100,
-            'Consumer': 100 + random.random() * 100,
-            'Energy': 60 + random.random() * 80,
-            'Industrial': 100 + random.random() * 100,
-            'Communications': 40 + random.random() * 60,
-            'Real Estate': 60 + random.random() * 80,
-        }
-        price = sector_prices.get(sector, 50 + random.random() * 100)
-        
-        # But try to use a more accurate price if we can
-        try:
-            # Quick Yahoo check one more time
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            if not hist.empty:
-                price = float(hist['Close'].iloc[-1])
-                if price > 0:
-                    logger.info(f"✅ Got real price for {ticker} on final attempt: ${price}")
-        except:
-            pass
-        
-        change = (random.random() - 0.3) * 4
-        rsi = 35 + random.random() * 30
-        after_hours = (random.random() - 0.1) * 2
-        
-        logger.warning(f"⚠️ Using fallback data for {ticker} with price ${price:.2f}")
-        
-        return {
-            "ticker": ticker,
-            "company": sector_info.get('name', ticker),
-            "sector": sector_info.get('sector', 'Unknown'),
-            "price": round(price, 2),
-            "change_1d": round(change, 2),
-            "rsi": round(rsi, 1),
-            "volume_ratio": round(0.8 + random.random() * 0.8, 2),
-            "trend": "BULLISH" if change > 0.5 else "NEUTRAL" if abs(change) < 0.3 else "BEARISH",
-            "trend_strength": "BULLISH" if change > 1 else "NEUTRAL",
-            "trend_icon": "📈" if change > 0.5 else "📉" if change < -0.5 else "➡️",
-            "sma20": round(price * 0.98, 2),
-            "sma50": round(price * 0.97, 2),
-            "price_vs_sma20": "ABOVE" if change > 0 else "BELOW",
-            "price_vs_sma50": "ABOVE" if change > -0.5 else "BELOW",
-            "consecutive_down_days": 0 if change > 0 else random.randint(1, 3),
-            "historical": {"dates": [], "prices": [], "volumes": []},
-            "pe_ratio": round(15 + random.random() * 20, 2),
-            "target_price": round(price * (1 + random.random() * 0.2), 2),
-            "current_volume": int(500000 + random.random() * 2000000),
-            "after_hours_price": round(price * (1 + after_hours / 100), 2),
-            "after_hours_pct": round(after_hours, 2),
-            "macd_bullish": change > 0,
-            "adx": round(15 + random.random() * 25, 1),
-            "breakout": change > 1.5 and rsi > 55,
-            "relative_strength": round((change * 2) + (random.random() - 0.5) * 4, 2),
-            "boll_signal": "OVERSOLD" if rsi < 35 else "OVERBOUGHT" if rsi > 65 else "NORMAL",
-            "support": round(price * 0.93, 2),
-            "resistance": round(price * 1.07, 2),
-        }
+            print(f"⚠️ Error getting data for {ticker}: {e}")
+            return None
     
     def get_news_sentiment(self, ticker):
-        if not self.news_scraper:
-            return {
-                'news_data': {},
-                'sentiment_scores': {'BULLISH': 0, 'POSITIVE': 0, 'NEUTRAL': 0, 'NEGATIVE': 0, 'BEARISH': 0},
-                'total_news': 0,
-                'sentiment_score': 0,
-                'avg_sentiment': 0,
-                'news_items': []
-            }
-        
         news_data = self.news_scraper.fetch_all_news(ticker)
         sentiment_scores = {'BULLISH': 0, 'POSITIVE': 0, 'NEUTRAL': 0, 'NEGATIVE': 0, 'BEARISH': 0}
         total_news = 0
@@ -2251,10 +1573,10 @@ class EnhancedStockAnalyzer:
         }
 
 # ============================================================
-# RECOMMENDATION ENGINE
+# ENHANCED RECOMMENDATION ENGINE
 # ============================================================
 
-def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, prediction_data):
+def generate_recommendation_enhanced(data, sentiment_score, ai_analysis):
     score = 50
     change = data['change_1d']
     rsi = data['rsi']
@@ -2263,19 +1585,12 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
     price_vs_sma50 = data.get('price_vs_sma50', 'BELOW')
     trend = data.get('trend', 'NEUTRAL')
     volume_ratio = data.get('volume_ratio', 1)
-    after_hours = data.get('after_hours_pct', 0)
-    macd_bullish = data.get('macd_bullish', False)
-    adx = data.get('adx', 0)
-    breakout = data.get('breakout', False)
-    relative_strength = data.get('relative_strength', 0)
-    boll_signal = data.get('boll_signal', 'NORMAL')
     
-    pred_change = 0
-    pred_confidence = 0
-    if prediction_data:
-        pred_change = prediction_data.get('expected_change', 0)
-        pred_confidence = prediction_data.get('confidence', 0)
+    # ============================================================
+    # ENHANCED SCORING - Prioritizes upward momentum
+    # ============================================================
     
+    # 1. PRICE DIRECTION - PRIMARY
     if change > 0:
         if change > 3:
             score += 28
@@ -2291,28 +1606,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         else:
             score -= 2
     
-    if pred_change > 2 and pred_confidence > 70:
-        score += 25
-    elif pred_change > 1 and pred_confidence > 60:
-        score += 18
-    elif pred_change > 0.5 and pred_confidence > 50:
-        score += 10
-    elif pred_change < -2 and pred_confidence > 70:
-        score -= 18
-    elif pred_change < -1 and pred_confidence > 60:
-        score -= 10
-    
-    if after_hours > 2:
-        score += 30
-    elif after_hours > 1:
-        score += 22
-    elif after_hours > 0.5:
-        score += 14
-    elif after_hours < -2:
-        score -= 15
-    elif after_hours < -1:
-        score -= 8
-    
+    # 2. CONSECUTIVE DOWN DAYS
     if consecutive_down >= 5:
         score -= 12
     elif consecutive_down >= 3:
@@ -2322,6 +1616,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
     else:
         score += 12
     
+    # 3. MOVING AVERAGES
     if price_vs_sma20 == 'ABOVE' and price_vs_sma50 == 'ABOVE':
         score += 22
     elif price_vs_sma20 == 'ABOVE':
@@ -2331,6 +1626,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
     elif price_vs_sma20 == 'BELOW':
         score -= 4
     
+    # 4. TREND STRENGTH
     if 'STRONG_BULLISH' in trend:
         score += 25
     elif 'BULLISH' in trend:
@@ -2340,6 +1636,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
     elif 'BEARISH' in trend:
         score -= 5
     
+    # 5. RSI
     if 40 < rsi < 70:
         score += 12
     elif 30 < rsi < 40:
@@ -2355,6 +1652,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         else:
             score += 12
     
+    # 6. VOLUME
     if volume_ratio > 1.5:
         if change > 0:
             score += 20
@@ -2366,6 +1664,7 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         else:
             score += 2
     
+    # 7. SENTIMENT
     if sentiment_score > 0.3:
         if change > 0:
             score += 20
@@ -2377,37 +1676,11 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         else:
             score -= 4
     
-    if macd_bullish:
-        score += 12
-    else:
-        score -= 6
-    
-    if adx > 30:
-        score += 12
-    elif adx > 25:
-        score += 8
-    elif adx < 15:
-        score -= 8
-    
-    if breakout:
-        score += 18
-    
-    if relative_strength > 5:
-        score += 12
-    elif relative_strength > 2:
-        score += 7
-    elif relative_strength < -3:
-        score -= 10
-    
-    if boll_signal == 'OVERSOLD':
-        score += 10
-    elif boll_signal == 'OVERBOUGHT':
-        score -= 8
-    
+    # 8. AI ANALYSIS
     if ai_analysis:
         ai_rec = ai_analysis.get('rec', 'WATCH')
-        technical_score = ai_analysis.get('technical_score', 50)
         ai_conf = ai_analysis.get('conf', 50)
+        technical_score = ai_analysis.get('technical_score', 50)
         
         if ai_rec in ['STRONG BUY']:
             score += 20
@@ -2418,8 +1691,10 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         
         score = (score * 0.5) + (technical_score * 0.3) + (ai_conf * 0.2)
     
+    # Ensure range
     score = max(10, min(90, round(score)))
     
+    # Determine recommendation
     if score >= 75:
         rec = "STRONG BUY"
         summary = f"📈 {data['ticker']} strong upward momentum with positive trend"
@@ -2436,22 +1711,10 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
         rec = "SELL"
         summary = f"🚨 {data['ticker']} bearish signals, consider exit"
     
-    if after_hours > 1:
-        summary += f" (📈 AFTER HOURS +{after_hours:.1f}%)"
-    elif after_hours > 0.5:
-        summary += f" (📈 After Hours +{after_hours:.1f}%)"
-    
-    if pred_change > 1 and pred_confidence > 60:
-        summary += f" (📊 Prediction: +{pred_change:.1f}% with {pred_confidence:.0f}% confidence)"
-    
     if price_vs_sma20 == 'ABOVE':
         summary += " (✅ Above SMA20)"
     if consecutive_down < 2 and change > 0:
         summary += " (📈 Positive momentum)"
-    if breakout:
-        summary += " (🚀 Breakout!)"
-    if macd_bullish:
-        summary += " (MACD Bullish)"
     
     confidence = min(100, round(score * 0.8 + 10))
     momentum_score = score
@@ -2459,29 +1722,42 @@ def generate_recommendation_enhanced(data, sentiment_score, ai_analysis, predict
     return rec, confidence, summary, momentum_score, score
 
 # ============================================================
-# MAIN ANALYSIS FUNCTIONS
+# MAIN ANALYSIS
 # ============================================================
 
-scan_stats = {"technical": 0, "openai": 0, "claude": 0, "groq": 0, "gemini": 0, "total": 0}
+scan_stats = {"technical": 0, "openai": 0, "claude": 0, "groq": 0, "total": 0}
 stock_analyzer = EnhancedStockAnalyzer()
-news_scraper = EnhancedNewsScraper()
-ai_engine = AIAnalysisEngine()
-prediction_engine = PricePredictionEngine()
-
-news_scraper.set_ai_engine(ai_engine)
-stock_analyzer.set_ai_engine(ai_engine)
-stock_analyzer.set_news_scraper(news_scraper)
-stock_analyzer.set_prediction_engine(prediction_engine)
-
 loaded_tickers = set()
+filter_settings = {"keywords": [], "sources": [], "categories": []}
 
 def get_tickers_by_sector(sector=None):
     if sector and sector != 'all':
-        return [t for t, info in ALL_STOCKS.items() if info.get('sector', '') == sector]
+        return [t for t, info in ALL_STOCKS.items() if info['sector'] == sector]
     return list(ALL_STOCKS.keys())
 
-def get_next_batch(sector=None, offset=0, batch_size=60, loaded_set=None):
+def get_next_batch(sector=None, offset=0, batch_size=30, loaded_set=None):
     all_tickers = get_tickers_by_sector(sector)
+    
+    if not loaded_set:
+        # Prioritize major stocks first
+        major_stocks = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'MPC', 'XOM', 'CVX', 'JPM', 'JNJ']
+        prioritized = []
+        for t in all_tickers:
+            if t in major_stocks:
+                prioritized.append((t, 3))
+            elif ALL_STOCKS.get(t, {}).get('sector') in ['Technology', 'Healthcare']:
+                prioritized.append((t, 2))
+            elif ALL_STOCKS.get(t, {}).get('sector') in ['Financial', 'Energy']:
+                prioritized.append((t, 1))
+            else:
+                prioritized.append((t, 0))
+        prioritized.sort(key=lambda x: x[1], reverse=True)
+        result = []
+        for priority in [3, 2, 1, 0]:
+            group = [t for t, p in prioritized if p == priority]
+            random.shuffle(group)
+            result.extend(group)
+        all_tickers = result
     
     if loaded_set:
         all_tickers = [t for t in all_tickers if t not in loaded_set]
@@ -2506,15 +1782,11 @@ def analyze_stock_complete(ticker, use_ai=True):
     total_news = news_analysis['total_news']
     news_items = news_analysis.get('news_items', [])
     
-    prediction_data = prediction_engine.predict_next_day(ticker, yahoo_data.get('historical', {}))
-    if prediction_data:
-        yahoo_data['prediction_data'] = prediction_data
-    
     ai_analysis = None
     ai_source = "Technical"
-    if use_ai:
+    if use_ai and not AI_DISABLED_GLOBALLY:
         ai_analysis = ai_engine.get_ai_analysis(
-            ticker, yahoo_data['company'], yahoo_data, sentiment_score, news_data, prediction_data
+            ticker, yahoo_data['company'], yahoo_data, sentiment_score, news_data
         )
         if ai_analysis:
             ai_source = ai_analysis.get('_source', 'AI')
@@ -2524,11 +1796,9 @@ def analyze_stock_complete(ticker, use_ai=True):
                 scan_stats["claude"] += 1
             elif 'Groq' in ai_source:
                 scan_stats["groq"] += 1
-            elif 'Gemini' in ai_source:
-                scan_stats["gemini"] += 1
     
     rec, confidence, summary, momentum_score, score = generate_recommendation_enhanced(
-        yahoo_data, sentiment_score, ai_analysis, prediction_data
+        yahoo_data, sentiment_score, ai_analysis
     )
     
     if ai_analysis:
@@ -2539,6 +1809,7 @@ def analyze_stock_complete(ticker, use_ai=True):
     
     scan_stats["total"] += 1
     
+    # Rank scoring
     rank_score = 0
     if rec in ['STRONG BUY']:
         rank_score += 35
@@ -2560,31 +1831,6 @@ def analyze_stock_complete(ticker, use_ai=True):
     rank_score += sentiment_score * 4
     rank_score += momentum_score * 0.2
     
-    if prediction_data:
-        pred_change = prediction_data.get('expected_change', 0)
-        pred_confidence = prediction_data.get('confidence', 0)
-        if pred_change > 2 and pred_confidence > 70:
-            rank_score += 20
-        elif pred_change > 1 and pred_confidence > 60:
-            rank_score += 12
-    
-    after_hours = yahoo_data.get('after_hours_pct', 0)
-    if after_hours > 2:
-        rank_score += 25
-    elif after_hours > 1:
-        rank_score += 18
-    elif after_hours > 0.5:
-        rank_score += 10
-    
-    if yahoo_data.get('breakout', False):
-        rank_score += 15
-    if yahoo_data.get('macd_bullish', False):
-        rank_score += 10
-    if yahoo_data.get('relative_strength', 0) > 5:
-        rank_score += 10
-    if yahoo_data.get('adx', 0) > 30:
-        rank_score += 8
-    
     if ai_analysis:
         rank_score += ai_analysis.get('conf', 0) * 0.12
     
@@ -2600,17 +1846,6 @@ def analyze_stock_complete(ticker, use_ai=True):
     }
     
     passes_filters = stock_analyzer.apply_filters(filtered_data)
-    
-    pred_display = None
-    if prediction_data:
-        pred_display = {
-            'predicted_price': prediction_data.get('predicted_price', 0),
-            'expected_change': prediction_data.get('expected_change', 0),
-            'confidence': prediction_data.get('confidence', 0),
-            'prediction': prediction_data.get('prediction', 'NEUTRAL'),
-            'support': prediction_data.get('support', 0),
-            'resistance': prediction_data.get('resistance', 0)
-        }
     
     result = {
         "ticker": ticker,
@@ -2645,17 +1880,7 @@ def analyze_stock_complete(ticker, use_ai=True):
         "technical_score": score,
         "passes_filters": passes_filters,
         "news_items": news_items[:5],
-        "price_direction": "UP" if yahoo_data['change_1d'] > 0 else "DOWN",
-        "after_hours_pct": yahoo_data.get('after_hours_pct', 0),
-        "after_hours_price": yahoo_data.get('after_hours_price', 0),
-        "macd_bullish": yahoo_data.get('macd_bullish', False),
-        "adx": yahoo_data.get('adx', 0),
-        "breakout": yahoo_data.get('breakout', False),
-        "relative_strength": yahoo_data.get('relative_strength', 0),
-        "boll_signal": yahoo_data.get('boll_signal', 'NORMAL'),
-        "support": yahoo_data.get('support', 0),
-        "resistance": yahoo_data.get('resistance', 0),
-        "prediction": pred_display
+        "price_direction": "UP" if yahoo_data['change_1d'] > 0 else "DOWN"
     }
     
     return result
@@ -2670,14 +1895,14 @@ def index():
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    global scan_stats, loaded_tickers
-    scan_stats = {"technical": 0, "openai": 0, "claude": 0, "groq": 0, "gemini": 0, "total": 0}
+    global scan_stats, filter_settings, loaded_tickers
+    scan_stats = {"technical": 0, "openai": 0, "claude": 0, "groq": 0, "total": 0}
     
     data = request.get_json() or {}
     tickers = data.get('tickers', [])
     use_ai = data.get('use_ai', True)
     sector = data.get('sector', None)
-    limit = data.get('limit', 60)
+    limit = data.get('limit', 30)
     offset = data.get('offset', 0)
     load_more = data.get('load_more', False)
     pinned = data.get('pinned', [])
@@ -2685,6 +1910,10 @@ def analyze():
     filters = data.get('filters', {})
     if filters:
         stock_analyzer.set_filters(filters)
+    
+    filter_settings["keywords"] = data.get('keywords', [])
+    filter_settings["sources"] = data.get('sources', [])
+    filter_settings["categories"] = data.get('categories', [])
     
     if not tickers:
         if load_more:
@@ -2711,7 +1940,7 @@ def analyze():
                 if result and result.get('passes_filters', True):
                     results.append(result)
             except Exception as e:
-                logger.error(f"⚠️ Error for {ticker}: {e}")
+                print(f"⚠️ Error for {ticker}: {e}")
     
     results.sort(key=lambda x: x.get('rank_score', 0), reverse=True)
     elapsed = round(time.time() - start_time, 2)
@@ -2734,10 +1963,9 @@ def analyze():
         'elapsed': elapsed,
         'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'ai_availability': {
-            'openai': openai_client is not None and not is_openai_rate_limited(),
+            'openai': openai_client is not None,
             'claude': claude_client is not None,
-            'groq': groq_client is not None and not is_groq_rate_limited(),
-            'gemini': gemini_client is not None
+            'groq': groq_client is not None
         },
         'filters': stock_analyzer.filters
     })
@@ -2753,8 +1981,7 @@ def export_data():
     columns = ['ticker', 'company', 'sector', 'price', 'change_1d', 'rsi', 'volume_ratio', 
                'trend', 'trend_strength', 'recommendation', 'confidence', 'rank_score', 'news_count', 
                'sentiment_aggregate', 'source', 'ai_source', 'momentum_score', 'technical_score',
-               'price_direction', 'consecutive_down_days', 'price_vs_sma20', 'price_vs_sma50',
-               'after_hours_pct', 'macd_bullish', 'adx', 'breakout', 'relative_strength', 'boll_signal']
+               'price_direction', 'consecutive_down_days', 'price_vs_sma20', 'price_vs_sma50']
     available_columns = [col for col in columns if col in df.columns]
     df = df[available_columns]
     
@@ -2768,147 +1995,136 @@ def export_data():
     )
 
 # ============================================================
-# PAPER TRADING ROUTES
+# PAPER TRADING ROUTES - UPDATED WITH FIXES
 # ============================================================
 
 @app.route('/api/paper/status', methods=['GET'])
 def paper_status():
-    try:
-        paper_db = PaperTradingDB()
-        user_id, cash, total_profit, total_trades, winning_trades = paper_db.get_or_create_user()
-        portfolio_value = paper_db.get_portfolio_value(user_id)
-        transactions = paper_db.get_transactions(user_id)
-        
-        portfolio_value['total_profit'] = total_profit
-        portfolio_value['total_trades'] = total_trades
-        portfolio_value['winning_trades'] = winning_trades
-        portfolio_value['win_rate'] = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        
-        return jsonify({
-            'success': True,
-            'user_id': user_id,
-            'cash': cash,
-            'portfolio': portfolio_value,
-            'transactions': transactions
+    user_id, cash = paper_trading.get_or_create_user()
+    portfolio_value = paper_trading.get_portfolio_value(user_id)
+    transactions = paper_trading.get_transactions(user_id)
+    
+    # Get recent transactions for display
+    recent_trades = []
+    for t in transactions[:5]:
+        recent_trades.append({
+            'ticker': t['ticker'],
+            'type': t['type'],
+            'shares': t['shares'],
+            'price': t['price'],
+            'total': t['total'],
+            'timestamp': t['timestamp']
         })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    
+    return jsonify({
+        'success': True,
+        'user_id': user_id,
+        'cash': cash,
+        'portfolio': portfolio_value,
+        'transactions': transactions,
+        'recent_trades': recent_trades
+    })
 
 @app.route('/api/paper/buy', methods=['POST'])
 def paper_buy():
+    data = request.get_json()
+    ticker = data.get('ticker', '').upper()
+    shares = float(data.get('shares', 0))
+    
+    if not ticker or shares <= 0:
+        return jsonify({'success': False, 'error': 'Invalid input'}), 400
+    
+    # Validate ticker exists
     try:
-        data = request.get_json()
-        ticker = data.get('ticker', '').upper()
-        shares = float(data.get('shares', 0))
-        
-        if not ticker or shares <= 0:
-            return jsonify({'success': False, 'error': 'Invalid input'}), 400
-        
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            if hist.empty:
-                return jsonify({'success': False, 'error': f'Could not get price for {ticker}'}), 400
-            price = float(hist['Close'].iloc[-1])
-        except Exception as e:
-            return jsonify({'success': False, 'error': f'Error getting price: {str(e)}'}), 400
-        
-        paper_db = PaperTradingDB()
-        user_id, _, _, _, _ = paper_db.get_or_create_user()
-        success, message = paper_db.buy_stock(user_id, ticker, shares, price)
-        
-        if success:
-            portfolio = paper_db.get_portfolio_value(user_id)
-            return jsonify({
-                'success': True,
-                'message': message,
-                'ticker': ticker,
-                'shares': shares,
-                'price': price,
-                'total': shares * price,
-                'portfolio': portfolio
-            })
-        else:
-            return jsonify({'success': False, 'message': message}), 400
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1d")
+        if hist.empty:
+            return jsonify({'success': False, 'error': f'Could not get price for {ticker}'}), 400
+        price = hist['Close'].iloc[-1]
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': f'Error getting price: {str(e)}'}), 400
+    
+    user_id, _ = paper_trading.get_or_create_user()
+    success, message = paper_trading.buy_stock(user_id, ticker, shares, price)
+    
+    # Get updated portfolio
+    portfolio = paper_trading.get_portfolio_value(user_id)
+    
+    return jsonify({
+        'success': success,
+        'message': message,
+        'ticker': ticker,
+        'shares': shares,
+        'price': price,
+        'total': shares * price,
+        'portfolio': portfolio
+    })
 
 @app.route('/api/paper/sell', methods=['POST'])
 def paper_sell():
+    data = request.get_json()
+    ticker = data.get('ticker', '').upper()
+    shares = float(data.get('shares', 0))
+    
+    if not ticker or shares <= 0:
+        return jsonify({'success': False, 'error': 'Invalid input'}), 400
+    
+    # Validate ticker exists
     try:
-        data = request.get_json()
-        ticker = data.get('ticker', '').upper()
-        shares = float(data.get('shares', 0))
-        
-        if not ticker or shares <= 0:
-            return jsonify({'success': False, 'error': 'Invalid input'}), 400
-        
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            if hist.empty:
-                return jsonify({'success': False, 'error': f'Could not get price for {ticker}'}), 400
-            price = float(hist['Close'].iloc[-1])
-        except Exception as e:
-            return jsonify({'success': False, 'error': f'Error getting price: {str(e)}'}), 400
-        
-        paper_db = PaperTradingDB()
-        user_id, _, _, _, _ = paper_db.get_or_create_user()
-        success, message = paper_db.sell_stock(user_id, ticker, shares, price)
-        
-        if success:
-            portfolio = paper_db.get_portfolio_value(user_id)
-            return jsonify({
-                'success': True,
-                'message': message,
-                'ticker': ticker,
-                'shares': shares,
-                'price': price,
-                'total': shares * price,
-                'portfolio': portfolio
-            })
-        else:
-            return jsonify({'success': False, 'message': message}), 400
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1d")
+        if hist.empty:
+            return jsonify({'success': False, 'error': f'Could not get price for {ticker}'}), 400
+        price = hist['Close'].iloc[-1]
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': f'Error getting price: {str(e)}'}), 400
+    
+    user_id, _ = paper_trading.get_or_create_user()
+    success, message = paper_trading.sell_stock(user_id, ticker, shares, price)
+    
+    # Get updated portfolio
+    portfolio = paper_trading.get_portfolio_value(user_id)
+    
+    return jsonify({
+        'success': success,
+        'message': message,
+        'ticker': ticker,
+        'shares': shares,
+        'price': price,
+        'total': shares * price,
+        'portfolio': portfolio
+    })
 
 @app.route('/api/paper/reset', methods=['POST'])
 def paper_reset():
-    try:
-        paper_db = PaperTradingDB()
-        user_id, _, _, _, _ = paper_db.get_or_create_user()
-        
-        conn = sqlite3.connect(paper_db.db_path)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM portfolio WHERE user_id = ?', (user_id,))
-        cursor.execute('DELETE FROM transactions WHERE user_id = ?', (user_id,))
-        cursor.execute('DELETE FROM performance_history WHERE user_id = ?', (user_id,))
-        cursor.execute('UPDATE users SET cash = 10000, total_profit = 0, total_trades = 0, winning_trades = 0 WHERE user_id = ?', (user_id,))
-        conn.commit()
-        conn.close()
-        
-        if user_id in paper_db.cache:
-            del paper_db.cache[user_id]
-        
-        return jsonify({'success': True, 'message': 'Account reset to $10,000'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    user_id, _ = paper_trading.get_or_create_user()
+    
+    conn = sqlite3.connect(paper_trading.db_path)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM portfolio WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM transactions WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM performance_history WHERE user_id = ?', (user_id,))
+    cursor.execute('UPDATE users SET cash = 10000 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+    
+    # Clear cache
+    if user_id in paper_trading.cache:
+        del paper_trading.cache[user_id]
+    
+    return jsonify({'success': True, 'message': 'Account reset to $10,000'})
 
 @app.route('/api/paper/history', methods=['GET'])
 def paper_history():
-    try:
-        paper_db = PaperTradingDB()
-        user_id, _, _, _, _ = paper_db.get_or_create_user()
-        days = request.args.get('days', 7, type=int)
-        history = paper_db.get_performance_history(user_id, days)
-        
-        return jsonify({
-            'success': True,
-            'history': history,
-            'days': days
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    user_id, _ = paper_trading.get_or_create_user()
+    days = request.args.get('days', 7, type=int)
+    history = paper_trading.get_performance_history(user_id, days)
+    
+    return jsonify({
+        'success': True,
+        'history': history,
+        'days': days
+    })
 
 @app.route('/api/news/sources')
 def get_news_sources():
@@ -2927,23 +2143,22 @@ def performance_stats():
 def status():
     return jsonify({
         'status': 'online',
-        'openai_available': openai_client is not None and not is_openai_rate_limited(),
+        'openai_available': openai_client is not None,
         'claude_available': claude_client is not None,
-        'groq_available': groq_client is not None and not is_groq_rate_limited(),
-        'gemini_available': gemini_client is not None,
+        'groq_available': groq_client is not None,
         'total_stocks': len(ALL_STOCKS),
         'news_sources': len(NEWS_SOURCES),
         'filters': stock_analyzer.filters
     })
 
 # ============================================================
-# HTML TEMPLATE - Same as before
+# HTML TEMPLATE - UPDATED WITH PAPER TRADING FIXES
 # ============================================================
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
-    <title>AI Stock Analyzer Pro</title>
+    <title>AI Stock Analyzer Pro - Paper Trading</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -2981,13 +2196,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .tab-btn{padding:6px 16px;border-radius:6px 6px 0 0;background:transparent;border:none;color:#888;cursor:pointer;font-size:12px;transition:all 0.3s;font-weight:600}
         .tab-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
         .tab-btn.active{color:#fff;background:rgba(102,126,234,0.2);border-bottom:2px solid #667eea}
-        .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;margin-top:10px}
-        .stock-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;transition:all 0.3s;cursor:pointer;min-height:360px;display:flex;flex-direction:column}
+        .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin-top:10px}
+        .stock-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;transition:all 0.3s;cursor:pointer;min-height:300px;display:flex;flex-direction:column}
         .stock-card:hover{transform:translateY(-3px);border-color:rgba(102,126,234,0.4);box-shadow:0 12px 35px rgba(0,0,0,0.3)}
         .stock-card.pinned{border-color:#FFD700;background:rgba(255,215,0,0.05)}
         .stock-card.bullish-highlight{border-color:#4CAF50;background:rgba(76,175,80,0.05)}
         .stock-card.downtrend-warning{border-color:#f44336;background:rgba(244,67,54,0.05)}
-        .stock-card.breakout-highlight{border-color:#FFD700;background:rgba(255,215,0,0.08)}
         .card-rec{padding:2px 10px;border-radius:14px;font-weight:700;font-size:10px;display:inline-block}
         .card-rec.strong-buy{background:rgba(76,175,80,0.25);color:#4CAF50;border:1px solid rgba(76,175,80,0.25)}
         .card-rec.buy{background:rgba(76,175,80,0.15);color:#81C784;border:1px solid rgba(76,175,80,0.15)}
@@ -3002,17 +2216,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
         .modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:1000;justify-content:center;align-items:center;padding:20px;backdrop-filter:blur(8px)}
         .modal.active{display:flex}
-        .modal-content{background:#1a1a2e;border:1px solid rgba(255,255,255,0.1);border-radius:18px;max-width:1000px;width:100%;max-height:90vh;overflow-y:auto;padding:22px}
+        .modal-content{background:#1a1a2e;border:1px solid rgba(255,255,255,0.1);border-radius:18px;max-width:950px;width:100%;max-height:90vh;overflow-y:auto;padding:22px}
         .modal-close{font-size:26px;cursor:pointer;background:none;border:none;color:#666;padding:0 6px}
         .modal-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:10px 0}
         .modal-stat{background:rgba(255,255,255,0.05);border-radius:6px;padding:8px}
         .modal-stat .label{color:#666;font-size:8px;text-transform:uppercase}
         .modal-stat .value{font-size:13px;font-weight:bold;margin-top:2px}
         .modal-chart{height:220px;margin:10px 0}
-        .modal-chart canvas{width:100% !important;height:100% !important}
-        .prediction-box{background:rgba(102,126,234,0.1);border:1px solid rgba(102,126,234,0.2);border-radius:8px;padding:12px;margin:10px 0}
-        .prediction-box .pred-title{color:#667eea;font-weight:bold;font-size:12px}
-        .prediction-box .pred-value{font-size:16px;font-weight:bold}
         .ranking-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}
         .ranking-item{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:8px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;transition:all 0.3s}
         .ranking-item:hover{background:rgba(255,255,255,0.06)}
@@ -3029,7 +2239,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .ai-badge.openai{background:rgba(255,152,0,0.2);color:#FFB74D}
         .ai-badge.claude{background:rgba(156,39,176,0.2);color:#CE93D8}
         .ai-badge.groq{background:rgba(76,175,80,0.2);color:#81C784}
-        .ai-badge.gemini{background:rgba(33,150,243,0.2);color:#64B5F6}
         .ai-badge.technical{background:rgba(255,255,255,0.05);color:#888}
         .news-feed{max-height:400px;overflow-y:auto}
         .news-item{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)}
@@ -3047,36 +2256,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .trend-bullish{color:#4CAF50}
         .trend-bearish{color:#f44336}
         .trend-neutral{color:#FFB74D}
-        .after-hours-up{color:#4CAF50;font-weight:bold}
-        .after-hours-down{color:#f44336;font-weight:bold}
-        .prediction-badge{padding:2px 6px;border-radius:4px;font-size:9px;font-weight:bold}
-        .prediction-bullish{background:rgba(76,175,80,0.2);color:#4CAF50}
-        .prediction-bearish{background:rgba(244,67,54,0.2);color:#f44336}
-        .prediction-neutral{background:rgba(255,152,0,0.2);color:#FFB74D}
-        .paper-trading-panel{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;margin-bottom:12px}
-        .paper-trading-panel h3{font-size:13px;margin-bottom:8px;color:#888}
-        .paper-trading-panel .paper-stats{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px}
-        .paper-trading-panel .paper-stat{text-align:center;padding:4px 2px;background:rgba(255,255,255,0.03);border-radius:4px;overflow:hidden}
-        .paper-trading-panel .paper-stat .value{font-size:13px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:1.3}
-        .paper-trading-panel .paper-stat .label{font-size:7px;color:#888;white-space:nowrap;display:block;margin-top:1px}
-        .paper-trading-panel .paper-row{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:4px 0;padding:6px;background:rgba(255,215,0,0.05);border-radius:6px}
-        .paper-trading-panel .paper-row .item{text-align:center}
-        .paper-trading-panel .paper-row .item .value{font-size:14px;font-weight:bold}
-        .paper-trading-panel .paper-row .item .label{font-size:7px;color:#888}
-        .paper-trading-panel .trade-form{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:6px;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px}
-        .paper-trading-panel .trade-form input{width:60px;padding:3px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:3px;background:rgba(255,255,255,0.05);color:#fff;font-size:10px}
-        .paper-trading-panel .trade-form select{padding:3px 6px;border:1px solid rgba(255,255,255,0.1);border-radius:3px;background:rgba(255,255,255,0.05);color:#fff;font-size:10px;width:55px}
-        .paper-trading-panel .btn-sm{padding:3px 8px;font-size:9px}
-        .paper-trading-panel .portfolio-item{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:10px}
-        .paper-trading-panel .profit-positive{color:#4CAF50}
-        .paper-trading-panel .profit-negative{color:#f44336}
-        .paper-trading-panel .sell-btn{background:rgba(244,67,54,0.15);border:1px solid rgba(244,67,54,0.2);color:#f44336;padding:1px 6px;border-radius:3px;cursor:pointer;font-size:8px}
-        .paper-trading-panel .sell-btn:hover{background:rgba(244,67,54,0.25)}
-        .paper-trading-panel .transaction-item{font-size:9px;color:#888;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
-        .paper-trading-panel .transaction-buy{color:#4CAF50}
-        .paper-trading-panel .transaction-sell{color:#f44336}
-        .paper-trading-panel .portfolio-scroll{max-height:150px;overflow-y:auto}
-        .paper-trading-panel .transactions-scroll{max-height:120px;overflow-y:auto}
+        .paper-trading-panel{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;margin-bottom:15px}
+        .paper-trading-panel h3{font-size:14px;margin-bottom:8px;color:#888}
+        .paper-stats{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+        .paper-stat{text-align:center;padding:8px;background:rgba(255,255,255,0.03);border-radius:6px}
+        .paper-stat .value{font-size:18px;font-weight:bold}
+        .paper-stat .label{font-size:9px;color:#888}
+        .trade-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;padding:10px;background:rgba(255,255,255,0.03);border-radius:8px}
+        .trade-form input{width:80px;padding:4px 8px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;background:rgba(255,255,255,0.05);color:#fff;font-size:11px}
+        .trade-form select{padding:4px 8px;border:1px solid rgba(255,255,255,0.1);border-radius:4px;background:rgba(255,255,255,0.05);color:#fff;font-size:11px}
+        .portfolio-item{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px}
+        .profit-positive{color:#4CAF50}
+        .profit-negative{color:#f44336}
+        .sell-btn{background:rgba(244,67,54,0.15);border:1px solid rgba(244,67,54,0.2);color:#f44336;padding:2px 10px;border-radius:4px;cursor:pointer;font-size:10px}
+        .sell-btn:hover{background:rgba(244,67,54,0.25)}
+        .transaction-item{font-size:10px;color:#888;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+        .transaction-buy{color:#4CAF50}
+        .transaction-sell{color:#f44336}
+        .portfolio-scroll{max-height:200px;overflow-y:auto}
+        .transactions-scroll{max-height:150px;overflow-y:auto}
         @media(max-width:768px){.app-container{flex-direction:column}.sidebar{width:100%;min-width:unset;max-height:400px}.card-grid{grid-template-columns:1fr}.paper-stats{grid-template-columns:1fr 1fr}}
     </style>
 </head>
@@ -3088,49 +2286,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button onclick="document.getElementById('sidebar').classList.toggle('collapsed')" style="background:none;border:none;color:#666;font-size:20px;cursor:pointer">✕</button>
         </div>
         
+        <!-- PAPER TRADING PANEL -->
         <div class="paper-trading-panel">
             <h3>💼 Paper Trading</h3>
             <div class="paper-stats">
                 <div class="paper-stat">
-                    <div class="value gold" id="paperCash">$10,000.00</div>
+                    <div class="value gold" id="paperCash">$10,000</div>
                     <div class="label">Cash</div>
                 </div>
                 <div class="paper-stat">
-                    <div class="value blue" id="paperValue">$0.00</div>
+                    <div class="value blue" id="paperValue">$0</div>
                     <div class="label">Holdings</div>
                 </div>
                 <div class="paper-stat">
-                    <div class="value" id="paperTotal">$10,000.00</div>
+                    <div class="value" id="paperTotal">$10,000</div>
                     <div class="label">Total Value</div>
                 </div>
                 <div class="paper-stat">
-                    <div class="value" id="paperPL" style="font-size:13px;font-weight:bold;">+$0.00</div>
+                    <div class="value" id="paperPL">+$0.00</div>
                     <div class="label">Total P&L</div>
                 </div>
             </div>
-            <div class="paper-row">
-                <div class="item">
-                    <span class="value gold" id="paperWinRate">0.0%</span>
-                    <div class="label">Win Rate</div>
-                </div>
-                <div class="item">
-                    <span class="value gold" id="paperTrades">0</span>
-                    <div class="label">Total Trades</div>
-                </div>
-            </div>
             <div class="trade-form">
-                <select id="tradeAction">
+                <select id="tradeAction" style="width:70px">
                     <option value="buy">BUY</option>
                     <option value="sell">SELL</option>
                 </select>
-                <input id="tradeTicker" placeholder="Ticker" style="width:55px">
-                <input id="tradeShares" placeholder="Shares" type="number" style="width:55px">
+                <input id="tradeTicker" placeholder="Ticker" style="width:70px">
+                <input id="tradeShares" placeholder="Shares" type="number" style="width:70px">
                 <button class="btn-success btn-sm" onclick="executeTrade()">Execute</button>
                 <button class="btn-danger btn-sm" onclick="resetPaperTrading()">Reset</button>
             </div>
-            <div id="tradeMessage" style="font-size:10px;margin-top:4px;color:#888"></div>
+            <div id="tradeMessage" style="font-size:11px;margin-top:4px;color:#888"></div>
         </div>
         
+        <!-- PORTFOLIO -->
         <div class="paper-trading-panel">
             <h3>📊 Portfolio</h3>
             <div class="portfolio-scroll" id="portfolioList">
@@ -3138,6 +2328,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
         
+        <!-- TRANSACTIONS -->
         <div class="paper-trading-panel">
             <h3>📜 Recent Transactions</h3>
             <div class="transactions-scroll" id="transactionList">
@@ -3145,16 +2336,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
         
+        <!-- AI STATUS -->
         <div style="margin-bottom:15px;padding:10px;background:rgba(102,126,234,0.1);border-radius:8px">
             <div style="font-size:11px;color:#888">🤖 AI Status</div>
             <div style="font-size:11px;margin-top:4px">
                 <span id="aiOpenAI" style="color:#FFB74D">● OpenAI</span>
                 <span id="aiClaude" style="color:#CE93D8">● Claude</span>
                 <span id="aiGroq" style="color:#4CAF50">● Groq</span>
-                <span id="aiGemini" style="color:#64B5F6">● Gemini</span>
             </div>
         </div>
         
+        <!-- FILTERS -->
         <div class="filters-section">
             <h4>💰 Price</h4>
             <div class="filter-row">
@@ -3164,6 +2356,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <input id="maxPrice" placeholder="10000" type="number">
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>📊 RSI</h4>
             <div class="filter-row">
@@ -3173,6 +2366,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <input id="maxRSI" placeholder="100" type="number">
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>📈 Volume Ratio</h4>
             <div class="filter-row">
@@ -3180,6 +2374,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <input id="minVolumeRatio" placeholder="0" type="number" step="0.1">
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>📊 Daily Change %</h4>
             <div class="filter-row">
@@ -3189,6 +2384,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <input id="maxChange" placeholder="100" type="number" step="0.1">
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>📈 Trend Filter</h4>
             <div class="filter-row">
@@ -3199,6 +2395,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>📰 News Sentiment</h4>
             <div class="filter-row">
@@ -3209,6 +2406,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
+        
         <div class="filters-section">
             <h4>🔍 Keyword Filter</h4>
             <div class="filter-row">
@@ -3217,10 +2415,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div id="keywordTags" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
         </div>
+        
         <div class="filters-section">
             <h4>📰 News Sources</h4>
             <div id="sourceGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:2px"></div>
         </div>
+        
         <div style="display:flex;gap:6px;margin-top:12px">
             <button onclick="applyFilters()" style="flex:1;padding:6px;border:none;border-radius:6px;background:#667eea;color:#fff;cursor:pointer">Apply Filters</button>
             <button onclick="resetFilters()" style="flex:1;padding:6px;border:1px solid rgba(255,255,255,0.1);border-radius:6px;background:transparent;color:#888;cursor:pointer">Reset</button>
@@ -3234,7 +2434,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="header-top">
                 <div>
                     <h1>🚀 <span class="gradient">AI Stock Analyzer Pro</span></h1>
-                    <div class="subtitle">200+ Stocks • 5 News Sources • Paper Trading • After Hours • AI Predictions</div>
+                    <div class="subtitle">60+ Stocks • 11 News Sources • Paper Trading • Trend-Aware AI</div>
                 </div>
                 <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                     <span id="statusDot" style="font-size:10px;color:#4CAF50">🟢 Live</span>
@@ -3269,10 +2469,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span>📰 News: <strong id="newsCount">0</strong></span>
                 <span>⚡ <span id="stockCount">0</span></span>
                 <span>📈 Momentum: <strong id="avgMomentum">0</strong></span>
-                <span>📊 MACD: <strong id="macdCount">0</strong></span>
-                <span>🚀 Breakouts: <strong id="breakoutCount">0</strong></span>
-                <span>🌙 After Hours: <strong id="afterHoursCount">0</strong></span>
-                <span>📊 Predictions: <strong id="predictionCount">0</strong></span>
             </div>
         </div>
         
@@ -3285,9 +2481,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="tab-btn" data-tab="losers" onclick="switchTab('losers')">📉 Top Losers</button>
             <button class="tab-btn" data-tab="uptrend" onclick="switchTab('uptrend')">📈 Uptrend</button>
             <button class="tab-btn" data-tab="downtrend" onclick="switchTab('downtrend')">📉 Downtrend</button>
-            <button class="tab-btn" data-tab="breakouts" onclick="switchTab('breakouts')">🚀 Breakouts</button>
-            <button class="tab-btn" data-tab="afterhours" onclick="switchTab('afterhours')">🌙 After Hours</button>
-            <button class="tab-btn" data-tab="predictions" onclick="switchTab('predictions')">📊 Predictions</button>
         </div>
         
         <div class="controls">
@@ -3323,7 +2516,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         <div id="loadingState" class="loading">
             <div class="spinner"></div>
-            <div style="color:#888;font-size:14px">📊 Loading stocks with AI predictions & after hours data...</div>
+            <div style="color:#888;font-size:14px">📊 Loading stocks with AI analysis...</div>
         </div>
         
         <div id="resultsContent" style="display:none">
@@ -3346,22 +2539,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span id="modalCompany" style="color:#888;font-size:12px"></span>
                 <span id="modalDirection" style="font-size:11px;font-weight:bold"></span>
                 <span id="modalTrend" style="font-size:11px;margin-left:8px"></span>
-                <span id="modalBreakout" style="font-size:11px;margin-left:8px;color:#FFD700"></span>
-                <span id="modalAfterHours" style="font-size:11px;margin-left:8px"></span>
-                <span id="modalPrediction" style="font-size:11px;margin-left:8px;color:#667eea"></span>
             </div>
             <button class="modal-close" onclick="closeModal()">&times;</button>
         </div>
         <div class="modal-grid" id="modalStats"></div>
-        <div id="modalPredictionBox" class="prediction-box" style="display:none">
-            <div class="pred-title">📊 AI Prediction</div>
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:6px">
-                <div><span style="color:#888;font-size:10px">Predicted Price</span><br><span class="pred-value" id="predPrice">$0.00</span></div>
-                <div><span style="color:#888;font-size:10px">Expected Change</span><br><span class="pred-value" id="predChange">0.0%</span></div>
-                <div><span style="color:#888;font-size:10px">Confidence</span><br><span class="pred-value" id="predConfidence">0%</span></div>
-                <div><span style="color:#888;font-size:10px">Prediction</span><br><span class="pred-value" id="predDirection">NEUTRAL</span></div>
-            </div>
-        </div>
         <div class="modal-chart"><canvas id="modalChart"></canvas></div>
         <div id="modalNews" style="margin-top:10px;max-height:200px;overflow-y:auto"></div>
         <div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.05)">
@@ -3373,6 +2554,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
 let allData = [];
 let currentSector = 'all';
 let currentTab = 'all';
@@ -3393,23 +2577,29 @@ let currentSort = 'rank_score';
 let sortDescending = true;
 let currentModalTicker = '';
 
+// ============================================================
+// PAPER TRADING FUNCTIONS - UPDATED
+// ============================================================
+
 async function updatePaperStatus() {
     try {
         const response = await fetch('/api/paper/status');
         const data = await response.json();
         if (data.success) {
             const portfolio = data.portfolio;
+            
+            // Update main stats
             document.getElementById('paperCash').textContent = '$' + portfolio.cash.toFixed(2);
             document.getElementById('paperValue').textContent = '$' + portfolio.total_holdings_value.toFixed(2);
             document.getElementById('paperTotal').textContent = '$' + portfolio.total_value.toFixed(2);
-            const profit = portfolio.total_profit || 0;
+            
+            // Update P&L
+            const pl = portfolio.total_profit_loss || 0;
             const plElement = document.getElementById('paperPL');
-            plElement.textContent = (profit >= 0 ? '+' : '') + '$' + profit.toFixed(2);
-            plElement.style.color = profit >= 0 ? '#4CAF50' : '#f44336';
-            const winRate = portfolio.win_rate || 0;
-            document.getElementById('paperWinRate').textContent = winRate.toFixed(1) + '%';
-            document.getElementById('paperWinRate').style.color = winRate >= 50 ? '#4CAF50' : '#f44336';
-            document.getElementById('paperTrades').textContent = portfolio.total_trades || 0;
+            plElement.textContent = (pl >= 0 ? '+' : '') + '$' + pl.toFixed(2);
+            plElement.style.color = pl >= 0 ? '#4CAF50' : '#f44336';
+            
+            // Update portfolio list
             const list = document.getElementById('portfolioList');
             if (portfolio.holdings && portfolio.holdings.length > 0) {
                 list.innerHTML = portfolio.holdings.map(h => `
@@ -3427,6 +2617,8 @@ async function updatePaperStatus() {
             } else {
                 list.innerHTML = '<div style="color:#666;font-size:11px;padding:8px 0">No holdings</div>';
             }
+            
+            // Update transactions
             const transList = document.getElementById('transactionList');
             if (data.transactions && data.transactions.length > 0) {
                 transList.innerHTML = data.transactions.slice(0, 10).map(t => `
@@ -3435,7 +2627,6 @@ async function updatePaperStatus() {
                         <strong>${t.ticker}</strong> 
                         ${t.shares} @ $${t.price.toFixed(2)} 
                         <span style="float:right">$${t.total.toFixed(2)}</span>
-                        ${t.profit_loss ? `<span style="float:right;margin-right:8px;color:${t.profit_loss >= 0 ? '#4CAF50' : '#f44336'}">${t.profit_loss >= 0 ? '+' : ''}$${t.profit_loss.toFixed(2)}</span>` : ''}
                         <span style="float:right;margin-right:8px;font-size:8px;color:#666">${new Date(t.timestamp).toLocaleTimeString()}</span>
                     </div>
                 `).join('');
@@ -3452,12 +2643,15 @@ async function executeTrade() {
     const action = document.getElementById('tradeAction').value;
     const ticker = document.getElementById('tradeTicker').value.toUpperCase().trim();
     const shares = parseFloat(document.getElementById('tradeShares').value);
+    
     if (!ticker || !shares || shares <= 0) {
         document.getElementById('tradeMessage').textContent = '⚠️ Invalid input';
         document.getElementById('tradeMessage').style.color = '#f44336';
         return;
     }
+    
     const endpoint = action === 'buy' ? '/api/paper/buy' : '/api/paper/sell';
+    
     try {
         const response = await fetch(endpoint, {
             method: 'POST',
@@ -3465,8 +2659,10 @@ async function executeTrade() {
             body: JSON.stringify({ ticker, shares })
         });
         const data = await response.json();
+        
         document.getElementById('tradeMessage').textContent = data.message;
         document.getElementById('tradeMessage').style.color = data.success ? '#4CAF50' : '#f44336';
+        
         if (data.success) {
             document.getElementById('tradeTicker').value = '';
             document.getElementById('tradeShares').value = '';
@@ -3482,7 +2678,9 @@ async function quickTrade(action) {
     if (!currentModalTicker) return;
     const shares = prompt(`Enter number of shares to ${action} for ${currentModalTicker}:`, '1');
     if (!shares || parseFloat(shares) <= 0) return;
+    
     const endpoint = action === 'buy' ? '/api/paper/buy' : '/api/paper/sell';
+    
     try {
         const response = await fetch(endpoint, {
             method: 'POST',
@@ -3492,7 +2690,9 @@ async function quickTrade(action) {
         const data = await response.json();
         document.getElementById('quickTradeInfo').textContent = data.message;
         document.getElementById('quickTradeInfo').style.color = data.success ? '#4CAF50' : '#f44336';
-        if (data.success) updatePaperStatus();
+        if (data.success) {
+            updatePaperStatus();
+        }
     } catch(e) {
         document.getElementById('quickTradeInfo').textContent = '⚠️ Error';
         document.getElementById('quickTradeInfo').style.color = '#f44336';
@@ -3502,10 +2702,7 @@ async function quickTrade(action) {
 async function quickSell(ticker, maxShares) {
     const shares = prompt(`Enter number of shares to sell for ${ticker} (max ${maxShares}):`, maxShares);
     if (!shares || parseFloat(shares) <= 0) return;
-    if (parseFloat(shares) > maxShares) {
-        alert(`You only have ${maxShares} shares of ${ticker}`);
-        return;
-    }
+    
     try {
         const response = await fetch('/api/paper/sell', {
             method: 'POST',
@@ -3513,9 +2710,14 @@ async function quickSell(ticker, maxShares) {
             body: JSON.stringify({ ticker, shares: parseFloat(shares) })
         });
         const data = await response.json();
-        if (data.success) updatePaperStatus();
-        else alert(data.message);
-    } catch(e) { alert('Error selling'); }
+        if (data.success) {
+            updatePaperStatus();
+        } else {
+            alert(data.message);
+        }
+    } catch(e) {
+        alert('Error selling');
+    }
 }
 
 async function resetPaperTrading() {
@@ -3528,8 +2730,14 @@ async function resetPaperTrading() {
             document.getElementById('tradeMessage').textContent = '✅ Account reset';
             document.getElementById('tradeMessage').style.color = '#4CAF50';
         }
-    } catch(e) { alert('Error resetting'); }
+    } catch(e) {
+        alert('Error resetting');
+    }
 }
+
+// ============================================================
+// TAB FUNCTIONS
+// ============================================================
 
 function switchTab(tab) {
     currentTab = tab;
@@ -3545,14 +2753,19 @@ function togglePin(ticker, event) {
     localStorage.setItem('pinnedStocks', JSON.stringify(pinnedStocks));
     renderCards();
     updateStats();
+    updatePaperStatus();
 }
 
 function isPinned(ticker) { return pinnedStocks.includes(ticker); }
 
 function setSort(sort) {
     const btn = document.querySelector(`.sort-btn[data-sort="${sort}"]`);
-    if (currentSort === sort) sortDescending = !sortDescending;
-    else { currentSort = sort; sortDescending = true; }
+    if (currentSort === sort) {
+        sortDescending = !sortDescending;
+    } else {
+        currentSort = sort;
+        sortDescending = true;
+    }
     document.querySelectorAll('.sort-btn').forEach(b => {
         b.classList.remove('active');
         if (b.dataset.sort === sort) {
@@ -3636,6 +2849,10 @@ function getFilters() {
     };
 }
 
+// ============================================================
+// LOAD SETTINGS & NEWS SOURCES
+// ============================================================
+
 async function loadSettings() {
     try {
         const response = await fetch('/api/news/sources');
@@ -3651,7 +2868,9 @@ async function loadSettings() {
                     <span>${src.icon} ${src.name}</span>
                 `;
                 grid.appendChild(div);
-                if (src.enabled !== false && !selectedSources.includes(key)) selectedSources.push(key);
+                if (src.enabled !== false && !selectedSources.includes(key)) {
+                    selectedSources.push(key);
+                }
             }
         }
     } catch(e) { console.error(e); }
@@ -3681,23 +2900,29 @@ function resetFilters() {
     keywords = [];
     renderKeywords();
     document.querySelectorAll('#sourceGrid input[type="checkbox"]').forEach(cb => cb.checked = true);
-    selectedSources = ['feedflash', 'finviz', 'yahoo', 'google_news', 'stocktwits'];
+    selectedSources = ['finviz', 'marketwatch', 'tradingview', 'yahoo', 'seekingalpha', 'google_news', 'stocktwits', 'bloomberg', 'cnbc', 'reuters', 'benzinga'];
     document.getElementById('keywordInput').value = '';
     currentOffset = 0;
     allData = [];
     refreshData();
 }
 
+// ============================================================
+// MAIN DATA REFRESH
+// ============================================================
+
 async function refreshData() {
     const btn = document.querySelector('.btn');
     btn.disabled = true;
     btn.textContent = '⏳...';
+    
     document.getElementById('loadingState').style.display = 'block';
     document.getElementById('resultsContent').style.display = 'none';
+    
     try {
         const payload = {
             sector: currentSector !== 'all' ? currentSector : null,
-            limit: 60,
+            limit: 30,
             offset: 0,
             load_more: false,
             use_ai: useAI,
@@ -3706,18 +2931,23 @@ async function refreshData() {
             pinned: pinnedStocks,
             filters: getFilters()
         };
+        
         const response = await fetch('/api/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
         const res = await response.json();
+        
         if (res.success) {
             allData = res.results;
             hasMore = res.has_more || false;
-            currentOffset = 60;
+            currentOffset = 30;
+            
             document.getElementById('lastUpdate').textContent = 'Updated: ' + res.last_update;
-            let totalNews = 0, totalMomentum = 0, macdCount = 0, breakoutCount = 0, afterHoursCount = 0, predictionCount = 0;
+            
+            let totalNews = 0;
+            let totalMomentum = 0;
             allData.forEach(item => {
                 if (item.news) {
                     for (const s in item.news) {
@@ -3725,33 +2955,28 @@ async function refreshData() {
                     }
                 }
                 totalMomentum += item.momentum_score || 0;
-                if (item.macd_bullish) macdCount++;
-                if (item.breakout) breakoutCount++;
-                if (Math.abs(item.after_hours_pct || 0) > 0.5) afterHoursCount++;
-                if (item.prediction && item.prediction.confidence > 50) predictionCount++;
             });
             document.getElementById('newsCount').textContent = totalNews;
             document.getElementById('stockCount').textContent = allData.length;
             document.getElementById('avgMomentum').textContent = allData.length > 0 ? Math.round(totalMomentum / allData.length) : 0;
-            document.getElementById('macdCount').textContent = macdCount;
-            document.getElementById('breakoutCount').textContent = breakoutCount;
-            document.getElementById('afterHoursCount').textContent = afterHoursCount;
-            document.getElementById('predictionCount').textContent = predictionCount;
-            const aiCount = res.stats ? (res.stats.openai || 0) + (res.stats.claude || 0) + (res.stats.groq || 0) + (res.stats.gemini || 0) : 0;
+            
+            const aiCount = res.stats ? (res.stats.openai || 0) + (res.stats.claude || 0) + (res.stats.groq || 0) : 0;
             document.getElementById('aiCount').textContent = aiCount;
+            
             if (res.ai_availability) {
                 document.getElementById('aiOpenAI').style.color = res.ai_availability.openai ? '#FFB74D' : '#666';
                 document.getElementById('aiClaude').style.color = res.ai_availability.claude ? '#CE93D8' : '#666';
                 document.getElementById('aiGroq').style.color = res.ai_availability.groq ? '#4CAF50' : '#666';
-                document.getElementById('aiGemini').style.color = res.ai_availability.gemini ? '#64B5F6' : '#666';
             }
+            
             renderCards();
             updateStats();
             updatePaperStatus();
             loadNewsFeed();
         }
-    } catch(err) { console.error(err); }
-    finally {
+    } catch(err) {
+        console.error(err);
+    } finally {
         document.getElementById('loadingState').style.display = 'none';
         document.getElementById('resultsContent').style.display = 'block';
         btn.disabled = false;
@@ -3776,11 +3001,13 @@ async function loadMoreStocks() {
     const btn = document.querySelector('.load-more-btn');
     btn.textContent = '⏳ Loading...';
     btn.disabled = true;
-    currentOffset += 60;
+    
+    currentOffset += 30;
+    
     try {
         const payload = {
             sector: currentSector !== 'all' ? currentSector : null,
-            limit: 60,
+            limit: 30,
             offset: currentOffset,
             load_more: true,
             use_ai: useAI,
@@ -3789,12 +3016,14 @@ async function loadMoreStocks() {
             pinned: pinnedStocks,
             filters: getFilters()
         };
+        
         const response = await fetch('/api/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
         const res = await response.json();
+        
         if (res.success && res.results.length > 0) {
             const existingTickers = new Set(allData.map(d => d.ticker));
             const newResults = res.results.filter(d => !existingTickers.has(d.ticker));
@@ -3804,32 +3033,42 @@ async function loadMoreStocks() {
             updateStats();
             updatePaperStatus();
         }
-    } catch(err) { console.error(err); }
-    finally {
+    } catch(err) {
+        console.error(err);
+    } finally {
         isLoadingMore = false;
         btn.textContent = '➕ Add More Stocks';
         btn.disabled = false;
     }
 }
 
+// ============================================================
+// RENDER FUNCTIONS
+// ============================================================
+
 function renderCards() {
     const grid = document.getElementById('cardGrid');
     const rankingContainer = document.getElementById('rankingContainer');
     const newsFeedContainer = document.getElementById('newsFeedContainer');
+    
     grid.style.display = 'none';
     rankingContainer.style.display = 'none';
     newsFeedContainer.style.display = 'none';
+    
     if (currentTab === 'newsfeed') {
         newsFeedContainer.style.display = 'block';
         renderNewsFeed(newsFeedContainer);
         return;
     }
+    
     let filtered = allData.filter(item => {
         if (currentSector !== 'all' && item.sector !== currentSector) return false;
         const search = document.getElementById('searchInput').value.toLowerCase();
         if (search && !item.ticker.toLowerCase().includes(search) && !item.company.toLowerCase().includes(search)) return false;
         return true;
     });
+    
+    // Tab-specific filtering
     if (currentTab === 'pinned') {
         filtered = filtered.filter(item => isPinned(item.ticker));
     } else if (currentTab === 'gainers') {
@@ -3840,34 +3079,33 @@ function renderCards() {
         filtered = filtered.filter(item => item.trend && (item.trend.includes('BULLISH') || item.trend.includes('UPTREND')));
     } else if (currentTab === 'downtrend') {
         filtered = filtered.filter(item => item.trend && (item.trend.includes('BEARISH') || item.trend.includes('DOWNTREND')));
-    } else if (currentTab === 'breakouts') {
-        filtered = filtered.filter(item => item.breakout === true);
-    } else if (currentTab === 'afterhours') {
-        filtered = filtered.filter(item => Math.abs(item.after_hours_pct || 0) > 0.5);
-        filtered.sort((a, b) => Math.abs(b.after_hours_pct || 0) - Math.abs(a.after_hours_pct || 0));
-    } else if (currentTab === 'predictions') {
-        filtered = filtered.filter(item => item.prediction && item.prediction.confidence > 50);
-        filtered.sort((a, b) => (b.prediction?.confidence || 0) - (a.prediction?.confidence || 0));
     }
-    if (currentSort && currentTab !== 'gainers' && currentTab !== 'losers' && currentTab !== 'afterhours' && currentTab !== 'predictions') {
+    
+    // Apply sorting
+    if (currentSort && currentTab !== 'gainers' && currentTab !== 'losers') {
         filtered.sort((a, b) => {
             let va = a[currentSort] ?? 0;
             let vb = b[currentSort] ?? 0;
-            if (typeof va === 'string') return sortDescending ? va.localeCompare(vb) : vb.localeCompare(va);
+            if (typeof va === 'string') {
+                return sortDescending ? va.localeCompare(vb) : vb.localeCompare(va);
+            }
             return sortDescending ? vb - va : va - vb;
         });
     }
+    
     if (currentTab === 'ranking' || currentTab === 'pinned') {
         rankingContainer.style.display = 'block';
         renderRankingList(filtered, rankingContainer);
         return;
     }
+    
     grid.style.display = 'grid';
     renderCardGrid(filtered, grid);
 }
 
 function renderCardGrid(filtered, grid) {
     grid.innerHTML = '';
+    
     filtered.forEach((item) => {
         const card = document.createElement('div');
         const isBullish = (item.trend && item.trend.includes('BULLISH')) && item.change_1d > 0;
@@ -3876,40 +3114,33 @@ function renderCardGrid(filtered, grid) {
         if (isPinned(item.ticker)) cardClass += ' pinned';
         if (isBullish) cardClass += ' bullish-highlight';
         if (isDowntrend) cardClass += ' downtrend-warning';
-        if (item.breakout) cardClass += ' breakout-highlight';
         card.className = cardClass;
         card.onclick = () => openModal(item);
+        
         const recClass = (item.recommendation || 'WATCH').toLowerCase().replace(' ', '-');
         const pinned = isPinned(item.ticker);
         const aiSource = item.ai_source || item.source || 'Technical';
-        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : aiSource.includes('Gemini') ? 'gemini' : 'technical';
+        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : 'technical';
         const momentum = item.momentum_score || 50;
         const sentiment = item.sentiment_aggregate || 0;
         const sentimentEmoji = sentiment > 0.3 ? '🟢' : sentiment < -0.3 ? '🔴' : '🟡';
         const direction = item.price_direction || (item.change_1d > 0 ? 'UP' : 'DOWN');
         const directionClass = direction === 'UP' ? 'direction-up' : 'direction-down';
         const downDays = item.consecutive_down_days || 0;
-        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
-        const macdSignal = item.macd_bullish ? '🟢' : '⚪';
-        const breakoutSignal = item.breakout ? '🚀 ' : '';
-        const ahPct = item.after_hours_pct || 0;
-        const ahDisplay = Math.abs(ahPct) > 0.5 ? `${ahPct > 0 ? '📈' : '📉'} AH ${ahPct > 0 ? '+' : ''}${ahPct.toFixed(1)}%` : '';
-        let predDisplay = '';
-        if (item.prediction && item.prediction.confidence > 50) {
-            const pred = item.prediction;
-            const predClass = pred.prediction === 'BULLISH' || pred.prediction === 'STRONG BULLISH' ? 'prediction-bullish' : pred.prediction === 'BEARISH' || pred.prediction === 'STRONG BEARISH' ? 'prediction-bearish' : 'prediction-neutral';
-            predDisplay = `<span class="prediction-badge ${predClass}">📊 ${pred.prediction} ${pred.expected_change > 0 ? '+' : ''}${pred.expected_change}%</span>`;
-        }
+        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : 
+                          item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
+        
         let newsCount = 0;
         if (item.news) {
             for (const s in item.news) {
                 if (item.news[s]) newsCount += item.news[s].length;
             }
         }
+        
         card.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:flex-start">
                 <div>
-                    <div style="font-size:17px;font-weight:700">${breakoutSignal}${item.ticker} ${pinned ? '📌' : ''}</div>
+                    <div style="font-size:17px;font-weight:700">${item.ticker} ${pinned ? '📌' : ''}</div>
                     <div style="font-size:11px;color:#888">${item.company}</div>
                 </div>
                 <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
@@ -3923,21 +3154,14 @@ function renderCardGrid(filtered, grid) {
                     ${item.change_1d?.toFixed(1) || '0.0'}% <span class="${directionClass}">${direction === 'UP' ? '▲' : '▼'}</span>
                 </span>
             </div>
-            ${ahDisplay ? `<div style="text-align:right;font-size:11px;font-weight:bold;color:${ahPct > 0 ? '#4CAF50' : '#f44336'};margin:-4px 0 4px 0">${ahDisplay}</div>` : ''}
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin:4px 0;font-size:11px;color:#aaa">
                 <div>RSI: ${item.rsi || 'N/A'}</div>
                 <div>Vol: ${item.volume_ratio?.toFixed(1) || 'N/A'}x</div>
                 <div class="${trendClass}">${item.trend_icon || '➡️'} ${item.trend || 'NEUTRAL'}</div>
                 <div>${sentimentEmoji} Sentiment</div>
             </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;font-size:10px;color:#888">
-                <div>MACD: ${macdSignal} ${item.macd_bullish ? 'BULL' : ''}</div>
-                <div>ADX: ${item.adx || 0}</div>
-                <div>RelStr: ${item.relative_strength || 0}%</div>
-            </div>
-            ${predDisplay ? `<div style="margin-top:2px">${predDisplay}</div>` : ''}
             ${downDays >= 2 ? `<div style="font-size:10px;color:#f44336;font-weight:bold">⚠️ ${downDays} consecutive down days</div>` : ''}
-            ${item.breakout ? `<div style="font-size:10px;color:#FFD700;font-weight:bold">🚀 BREAKOUT ABOVE 20-DAY HIGH</div>` : ''}
+            ${isBullish ? `<div style="font-size:10px;color:#4CAF50;font-weight:bold">✅ Uptrend momentum</div>` : ''}
             <div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin:2px 0">
                 <span>Momentum: ${momentum}%</span>
                 <span>📰 ${newsCount}</span>
@@ -3965,15 +3189,13 @@ function renderRankingList(filtered, container) {
             <span style="min-width:50px;text-align:right">Momentum</span>
             <span style="min-width:60px;text-align:center">Rec</span>
             <span style="min-width:50px;text-align:center">Trend</span>
-            <span style="min-width:50px;text-align:center">MACD</span>
             <span style="min-width:60px;text-align:center">AI</span>
-            <span style="min-width:50px;text-align:center">AH</span>
-            <span style="min-width:60px;text-align:center">Pred</span>
             <span style="min-width:50px;text-align:right">Score</span>
             <span style="min-width:30px;text-align:center">📌</span>
         </div>
         <div style="display:flex;flex-direction:column;gap:4px;margin-top:6px">
     `;
+    
     filtered.forEach((item, index) => {
         const pinned = isPinned(item.ticker);
         const isBullish = (item.trend && item.trend.includes('BULLISH')) && item.change_1d > 0;
@@ -3982,23 +3204,21 @@ function renderRankingList(filtered, container) {
         if (pinned) rowClass += ' pinned';
         if (isBullish) rowClass += ' bullish-highlight';
         if (isDowntrend) rowClass += ' downtrend-warning';
-        if (item.breakout) rowClass += ' breakout-highlight';
+        
         const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index+1}`;
         const aiSource = item.ai_source || item.source || 'Technical';
-        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : aiSource.includes('Gemini') ? 'gemini' : 'technical';
+        const aiClass = aiSource.includes('OpenAI') ? 'openai' : aiSource.includes('Claude') ? 'claude' : aiSource.includes('Groq') ? 'groq' : 'technical';
         const momentum = item.momentum_score || 50;
         const direction = item.price_direction || (item.change_1d > 0 ? 'UP' : 'DOWN');
         const downDays = item.consecutive_down_days || 0;
         const trendDisplay = item.trend ? item.trend.substring(0, 12) : 'NEUTRAL';
-        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
-        const macdDisplay = item.macd_bullish ? '🟢BULL' : '⚪';
-        const breakoutDisplay = item.breakout ? '🚀' : '';
-        const ahDisplay = Math.abs(item.after_hours_pct || 0) > 0.5 ? `${item.after_hours_pct > 0 ? '🟢' : '🔴'}${(item.after_hours_pct || 0).toFixed(1)}%` : '';
-        const predDisplay = item.prediction && item.prediction.confidence > 50 ? `${item.prediction.expected_change > 0 ? '📈' : '📉'}${(item.prediction.expected_change || 0).toFixed(1)}%` : '';
+        const trendClass = item.trend && item.trend.includes('BULLISH') ? 'trend-bullish' : 
+                          item.trend && item.trend.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
+        
         container.innerHTML += `
             <div class="${rowClass}" onclick="openModal(item)" data-ticker="${item.ticker}">
                 <span style="min-width:30px;font-weight:bold;color:#667eea">${rankEmoji}</span>
-                <span style="min-width:60px;font-weight:600">${breakoutDisplay}${item.ticker}</span>
+                <span style="min-width:60px;font-weight:600">${item.ticker}</span>
                 <span style="flex:1;font-size:11px;color:#888">${item.company}</span>
                 <span style="min-width:60px;text-align:right;font-weight:600">$${item.price?.toFixed(2) || 'N/A'}</span>
                 <span style="min-width:60px;text-align:right;font-weight:600;color:${item.change_1d >= 0 ? '#4CAF50' : '#f44336'}">
@@ -4008,57 +3228,35 @@ function renderRankingList(filtered, container) {
                 <span style="min-width:50px;text-align:right;font-weight:600;color:${momentum >= 60 ? '#4CAF50' : momentum >= 40 ? '#FFB74D' : '#f44336'}">${momentum}%</span>
                 <span style="min-width:60px;text-align:center;padding:2px 8px;border-radius:10px;font-weight:600;font-size:9px;background:rgba(102,126,234,0.1);color:#667eea">${item.recommendation || 'WATCH'}</span>
                 <span style="min-width:50px;text-align:center;font-size:9px" class="${trendClass}">${trendDisplay}${downDays >= 3 ? '⚠️' : ''}</span>
-                <span style="min-width:50px;text-align:center;font-size:9px">${macdDisplay}</span>
                 <span style="min-width:60px;text-align:center"><span class="ai-badge ${aiClass}">${aiSource}</span></span>
-                <span style="min-width:50px;text-align:center;font-size:9px">${ahDisplay}</span>
-                <span style="min-width:60px;text-align:center;font-size:9px">${predDisplay}</span>
                 <span style="min-width:50px;text-align:right;font-weight:bold;color:#667eea">${Math.round(item.rank_score || 0)}</span>
                 <button class="pin-btn ${pinned ? 'pinned' : ''}" onclick="togglePin('${item.ticker}', event)" style="min-width:30px;text-align:center">📌</button>
             </div>
         `;
     });
+    
     container.innerHTML += '</div>';
 }
 
 function renderNewsFeed(container) {
-    const groupedNews = {};
-    newsFeed.forEach(n => {
-        const source = n.source || 'Unknown';
-        if (!groupedNews[source]) groupedNews[source] = [];
-        groupedNews[source].push(n);
-    });
-    let html = `
+    container.innerHTML = `
         <div style="margin-bottom:12px">
             <h3 style="font-size:16px;margin-bottom:8px">📰 Live News Feed</h3>
-            <div style="font-size:11px;color:#888">${newsFeed.length} recent news items from ${Object.keys(groupedNews).length} sources</div>
+            <div style="font-size:11px;color:#888">${newsFeed.length} recent news items from 11 sources</div>
         </div>
         <div class="news-feed">
-    `;
-    for (const [source, items] of Object.entries(groupedNews)) {
-        const sourceIcon = {'FeedFlash': '⚡', 'Finviz': '📊', 'Yahoo Finance': '💹', 'Google News': '🔍', 'StockTwits': '💬'}[source] || '📰';
-        html += `
-            <div style="margin-bottom:8px;padding:6px;background:rgba(255,255,255,0.03);border-radius:6px;border-left:2px solid rgba(102,126,234,0.3)">
-                <div style="font-size:10px;color:#667eea;font-weight:bold;margin-bottom:4px">${sourceIcon} ${source}</div>
-        `;
-        items.slice(0, 5).forEach(n => {
-            const sentimentEmoji = n.sentiment?.label === 'BULLISH' ? '🟢' : n.sentiment?.label === 'BEARISH' ? '🔴' : n.sentiment?.label === 'POSITIVE' ? '🟢' : n.sentiment?.label === 'NEGATIVE' ? '🔴' : '🟡';
-            const headline = n.headline || 'No headline';
-            const shortHeadline = headline.length > 120 ? headline.substring(0, 120) + '...' : headline;
-            html += `
+            ${newsFeed.length > 0 ? newsFeed.slice(0, 150).map(n => `
                 <div class="news-item">
-                    <div style="font-size:11px;color:#ddd">${sentimentEmoji} ${shortHeadline}</div>
-                    <div style="display:flex;gap:8px;font-size:8px;color:#666;margin-top:1px">
-                        <span>${n.time || ''}</span>
+                    <div style="font-size:12px">${n.headline || 'No headline'}</div>
+                    <div style="display:flex;gap:8px;font-size:9px;color:#666;margin-top:2px">
+                        <span>📰 ${n.source || 'Unknown'}</span>
                         <span>Sentiment: ${n.sentiment?.label || 'NEUTRAL'}</span>
-                        ${n.user ? `<span>👤 ${n.user}</span>` : ''}
+                        ${n.time ? `<span>🕐 ${n.time}</span>` : ''}
                     </div>
                 </div>
-            `;
-        });
-        html += `</div>`;
-    }
-    html += `</div>`;
-    container.innerHTML = html;
+            `).join('') : '<div style="color:#666;padding:20px;text-align:center">No news available</div>'}
+        </div>
+    `;
 }
 
 function updateStats() {
@@ -4089,8 +3287,15 @@ function toggleAI() {
     refreshData();
 }
 
+// ============================================================
+// EXPORT DATA
+// ============================================================
+
 async function exportData() {
-    if (allData.length === 0) { alert('No data to export.'); return; }
+    if (allData.length === 0) {
+        alert('No data to export.');
+        return;
+    }
     try {
         const response = await fetch('/api/export', {
             method: 'POST',
@@ -4108,8 +3313,14 @@ async function exportData() {
             document.body.removeChild(a);
             window.URL.revokeObjectURL(url);
         }
-    } catch(err) { alert('Error exporting: ' + err.message); }
+    } catch(err) {
+        alert('Error exporting: ' + err.message);
+    }
 }
+
+// ============================================================
+// MODAL FUNCTIONS
+// ============================================================
 
 function openModal(item) {
     currentModalTicker = item.ticker;
@@ -4119,47 +3330,22 @@ function openModal(item) {
     const directionClass = direction === 'UP' ? 'direction-up' : 'direction-down';
     document.getElementById('modalDirection').textContent = `${direction} ${direction === 'UP' ? '▲' : '▼'} (${item.change_1d?.toFixed(1)}%)`;
     document.getElementById('modalDirection').className = directionClass;
+    
     const trendDisplay = item.trend || 'NEUTRAL';
     const trendClass = trendDisplay.includes('BULLISH') ? 'trend-bullish' : trendDisplay.includes('BEARISH') ? 'trend-bearish' : 'trend-neutral';
     document.getElementById('modalTrend').textContent = `📊 ${trendDisplay}`;
     document.getElementById('modalTrend').className = trendClass;
-    document.getElementById('modalBreakout').textContent = item.breakout ? '🚀 BREAKOUT' : '';
-    document.getElementById('modalBreakout').style.color = item.breakout ? '#FFD700' : '';
-    const ahPct = item.after_hours_pct || 0;
-    const ahText = Math.abs(ahPct) > 0.1 ? `🌙 After Hours: ${ahPct > 0 ? '+' : ''}${ahPct.toFixed(2)}%` : '';
-    document.getElementById('modalAfterHours').textContent = ahText;
-    document.getElementById('modalAfterHours').style.color = ahPct > 0 ? '#4CAF50' : ahPct < 0 ? '#f44336' : '#888';
-    const predBox = document.getElementById('modalPredictionBox');
-    if (item.prediction && item.prediction.confidence > 50) {
-        predBox.style.display = 'block';
-        document.getElementById('predPrice').textContent = '$' + (item.prediction.predicted_price || 0).toFixed(2);
-        const predChange = item.prediction.expected_change || 0;
-        document.getElementById('predChange').textContent = (predChange > 0 ? '+' : '') + predChange.toFixed(2) + '%';
-        document.getElementById('predChange').style.color = predChange > 0 ? '#4CAF50' : predChange < 0 ? '#f44336' : '#FFB74D';
-        document.getElementById('predConfidence').textContent = (item.prediction.confidence || 0).toFixed(0) + '%';
-        const predDir = item.prediction.prediction || 'NEUTRAL';
-        document.getElementById('predDirection').textContent = predDir;
-        document.getElementById('predDirection').style.color = predDir.includes('BULLISH') ? '#4CAF50' : predDir.includes('BEARISH') ? '#f44336' : '#FFB74D';
-        document.getElementById('modalPrediction').textContent = `📊 ${predDir} ${predChange > 0 ? '+' : ''}${predChange.toFixed(1)}%`;
-    } else {
-        predBox.style.display = 'none';
-        document.getElementById('modalPrediction').textContent = '';
-    }
+    
     const stats = [
         { label: 'Price', value: '$' + (item.price?.toFixed(2) || 'N/A') },
-        { label: 'Change', value: (item.change_1d?.toFixed(1) || '0.0') + '%', class: item.change_1d >= 0 ? 'green' : 'red' },
-        { label: 'After Hours', value: (item.after_hours_pct?.toFixed(2) || '0.00') + '%', class: (item.after_hours_pct || 0) >= 0 ? 'green' : 'red' },
+        { label: 'Change', value: (item.change_1d?.toFixed(1) || '0.0') + '%', class: item.change_1d >= 0 ? 'positive' : 'negative' },
         { label: 'RSI', value: item.rsi || 'N/A' },
         { label: 'Volume Ratio', value: item.volume_ratio?.toFixed(2) || 'N/A' },
         { label: 'Momentum', value: (item.momentum_score || 50) + '%' },
         { label: 'P/E', value: item.pe_ratio || 'N/A' },
         { label: 'SMA20', value: '$' + (item.sma20?.toFixed(2) || 'N/A') },
         { label: 'SMA50', value: '$' + (item.sma50?.toFixed(2) || 'N/A') },
-        { label: 'MACD', value: item.macd_bullish ? '🟢 Bullish' : '🔴 Bearish' },
-        { label: 'Relative Strength', value: (item.relative_strength || 0) + '%' },
-        { label: 'ADX', value: item.adx || 0 },
-        { label: 'Bollinger', value: item.boll_signal || 'NORMAL' },
-        { label: 'Breakout', value: item.breakout ? '🚀 YES' : 'No' },
+        { label: 'Price vs SMA20', value: item.price_vs_sma20 || 'N/A', class: item.price_vs_sma20 === 'ABOVE' ? 'trend-bullish' : 'trend-bearish' },
         { label: 'Recommendation', value: item.recommendation || 'WATCH' },
         { label: 'Confidence', value: item.confidence + '%' },
         { label: 'Source', value: item.ai_source || item.source || 'Technical' },
@@ -4167,6 +3353,7 @@ function openModal(item) {
         { label: 'Sentiment', value: (item.sentiment_aggregate || 0).toFixed(2) },
         { label: 'Rank Score', value: Math.round(item.rank_score || 0) }
     ];
+    
     const modalStats = document.getElementById('modalStats');
     modalStats.innerHTML = '';
     stats.forEach(s => {
@@ -4175,16 +3362,21 @@ function openModal(item) {
         div.innerHTML = `<div class="label">${s.label}</div><div class="value ${s.class || ''}">${s.value}</div>`;
         modalStats.appendChild(div);
     });
+    
     if (chart) chart.destroy();
     const ctx = document.getElementById('modalChart').getContext('2d');
     const hist = item.historical;
     if (hist && hist.dates && hist.dates.length > 0) {
         chart = new Chart(ctx, {
             type: 'line',
-            data: { labels: hist.dates, datasets: [{ label: 'Price', data: hist.prices, borderColor: '#667eea', backgroundColor: 'rgba(102,126,234,0.1)', fill: true, tension: 0.4, pointRadius: 0, borderWidth: 2 }] },
-            options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { display: true, labels: { color: '#888', font: { size: 10 } } }, tooltip: { callbacks: { label: function(context) { return '$' + context.parsed.y.toFixed(2); } } } }, scales: { y: { ticks: { color: '#666', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,0.05)' } }, x: { ticks: { color: '#666', font: { size: 8 }, maxTicksLimit: 10 }, grid: { display: false } } } }
+            data: { 
+                labels: hist.dates, 
+                datasets: [{ label: 'Price', data: hist.prices, borderColor: '#667eea', backgroundColor: 'rgba(102,126,234,0.1)', fill: true, tension: 0.4, pointRadius: 0 }]
+            },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true, labels: { color: '#888', font: { size: 9 } } } } }
         });
     }
+    
     const modalNews = document.getElementById('modalNews');
     modalNews.innerHTML = '';
     if (item.news_items && item.news_items.length > 0) {
@@ -4199,6 +3391,7 @@ function openModal(item) {
     } else {
         modalNews.innerHTML = '<div style="color:#666;padding:10px">No news available</div>';
     }
+    
     document.getElementById('quickTradeInfo').textContent = '';
     document.getElementById('detailModal').classList.add('active');
 }
@@ -4210,6 +3403,10 @@ function closeModal() {
 
 document.getElementById('detailModal').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
 
 const savedTheme = localStorage.getItem('darkMode');
 if (savedTheme === 'false') {
@@ -4232,35 +3429,44 @@ refreshData();
 
 if __name__ == '__main__':
     print("\n" + "="*80)
-    print("🚀 AI Stock Analyzer Pro - FULLY FIXED")
+    print("🚀 AI Stock Analyzer Pro - COMPLETE WITH PAPER TRADING (FIXED)")
     print("="*80)
     print(f"📈 Total Stocks: {len(ALL_STOCKS)}")
-    print(f"📰 News Sources: {len(NEWS_SOURCES)}")
+    print(f"📰 News Sources: {len(NEWS_SOURCES)} (ALL 11 WORKING)")
     print(f"🤖 OpenAI: {'✅ Available' if openai_client else '❌ Not available'}")
     print(f"🤖 Claude: {'✅ Available' if claude_client else '❌ Not available'}")
     print(f"🤖 Groq: {'✅ Available' if groq_client else '❌ Not available'}")
-    print(f"🤖 Gemini: {'✅ Available' if gemini_client else '❌ Not available'}")
     print("="*80)
-    print("🔧 FIXES APPLIED:")
-    print("   ✅ Fixed pricing - now uses REAL prices from Yahoo Finance")
-    print("   ✅ Alpha Vantage backup for when Yahoo fails")
-    print("   ✅ Proper price validation to avoid random fallback data")
-    print("   ✅ Real historical data for accurate analysis")
-    print("   ✅ Fixed Citigroup (C) price from $55.44 to $133.57")
-    print("   ✅ All stocks now show accurate market prices")
-    print("   ✅ Fixed FeedFlash scraper - properly extracts articles")
-    print("   ✅ Removed navigation/menu items from news feed")
-    print("   ✅ Added global AI rate limiting (100 calls/min)")
-    print("   ✅ OpenAI rate limit handling with 5-min cooldown")
-    print("   ✅ Groq rate limit handling with 10-min cooldown")
-    print("   ✅ Claude 401 Unauthorized handling")
-    print("   ✅ Increased batch size to 60 stocks")
-    print("   ✅ Fixed P&L positioning in sidebar")
-    print("   ✅ Smaller font sizes for paper trading panel")
-    print("   ✅ 2-column layout for paper trading stats")
+    print("📊 FIXES & NEW FEATURES:")
+    print("   ✅ ALL 11 News Sources working")
+    print("   ✅ MPC and other uptrend stocks get BUY recommendations")
+    print("   ✅ Enhanced scoring - more BUY opportunities")
+    print("   ✅ PAPER TRADING - Simulate buying/selling with $10,000")
+    print("   ✅ ACCURATE CALCULATIONS - Cash, Holdings Value, Total Value")
+    print("   ✅ Total P&L tracking with percentage")
+    print("   ✅ Transaction history with timestamps")
+    print("   ✅ Portfolio value caching for performance")
+    print("   ✅ Performance history tracking")
+    print("   ✅ Quick trade buttons in stock detail modal")
+    print("   ✅ Visual bullish/downtrend highlights")
+    print("   ✅ Balanced recommendations (not all SELL/AVOID)")
+    print("   ✅ SYNTAX ERRORS FIXED")
     print("="*80)
-    print("🌐 Running on:", "Railway" if IS_RAILWAY else "Local")
-    print(f"📡 Port: {PORT}")
+    print("💼 PAPER TRADING FEATURES:")
+    print("   • Start with $10,000 virtual cash")
+    print("   • Buy/Sell stocks at real market prices")
+    print("   • Track portfolio value and P&L")
+    print("   • Reset account anytime")
+    print("   • Quick trade from any stock's detail view")
+    print("   • Transaction history with P&L per trade")
+    print("   • Portfolio performance tracking over time")
     print("="*80)
-    
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    if not openai_client:
+        print("⚠️ OpenAI not available. To fix:")
+        print("   1. Add OPENAI_API_KEY=your_key to .env file")
+        print("   2. Install openai: pip install openai")
+        print("   3. Restart the server")
+        print("="*80)
+    print("🌐 http://localhost:5000")
+    print("="*80 + "\n")
+    app.run(debug=True, host='0.0.0.0', port=5000)
